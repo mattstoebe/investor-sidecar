@@ -1,0 +1,121 @@
+<!doctype html>
+<!--
+  Dev harness. NOT part of the extension package -- it lives outside public/, so Vite never
+  copies it, and `npm run harness` stages it into dist/ only to be served.
+
+  Why it exists: vitest runs in jsdom, which has no layout engine, so every test can pass
+  while the panel is visibly broken. getByText('$316,500') matches happily when the user is
+  actually seeing "$316,5...". This renders the real panel at real widths and can be measured.
+
+  It runs the real background.js against a chrome.* shim, so panel and worker talk over the
+  actual message protocol -- capture, edit, delete and undo all exercise the shipped worker
+  rather than a reimplementation of it.
+
+  To find clipped text at a given width, open a fixed-width iframe of this page and look for
+  elements whose scrollWidth exceeds their clientWidth:
+
+    [...d.querySelectorAll('*')]
+      .filter(e => !e.children.length && e.textContent.trim()
+                   && e.scrollWidth > e.clientWidth + 1 && e.clientWidth > 0)
+
+  That check is what caught the metric strip truncating below 440px.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Investor Sidecar — panel harness</title>
+    <link rel="stylesheet" href="/assets/index.css" />
+    <script>
+      // A chrome.* shim faithful enough to run the REAL panel against the REAL service
+      // worker. background.js is imported below, so its message handlers -- capture, edit,
+      // delete, undo -- are the ones under test here, not a reimplementation of them.
+      // Panel and worker listeners share one bus; their action namespaces are disjoint
+      // (the panel only handles updateSidePanel), so broadcasting to both is safe.
+      const store = {};
+      const listeners = [];
+
+      function get(keys, cb) {
+        const wanted = keys == null ? Object.keys(store) : (Array.isArray(keys) ? keys : [keys]);
+        const out = {};
+        for (const k of wanted) if (k in store) out[k] = structuredClone(store[k]);
+        if (cb) { cb(out); return; }
+        return Promise.resolve(out);
+      }
+      function set(items, cb) {
+        for (const [k, v] of Object.entries(items)) store[k] = structuredClone(v);
+        if (cb) { cb(); return; }
+        return Promise.resolve();
+      }
+      function sendMessage(msg, cb) {
+        const p = new Promise((resolve) => {
+          let settled = false;
+          const respond = (r) => { if (!settled) { settled = true; resolve(r); } };
+          let async = false;
+          for (const l of [...listeners]) {
+            try { if (l(msg, {}, respond) === true) async = true; }
+            catch (e) { console.error('[harness] listener threw', e); }
+          }
+          if (!async) setTimeout(() => respond(undefined), 0);
+        });
+        if (cb) { p.then(cb); return; }
+        return p;
+      }
+
+      window.chrome = {
+        storage: { local: { get, set } },
+        runtime: {
+          sendMessage,
+          lastError: undefined,
+          onMessage: {
+            addListener: (l) => listeners.push(l),
+            removeListener: (l) => {
+              const i = listeners.indexOf(l);
+              if (i !== -1) listeners.splice(i, 1);
+            }
+          },
+          onInstalled: { addListener: () => {} }
+        },
+        // Only reached on the delete path, to tell a content script the house is gone.
+        tabs: { query: (_q, cb) => cb([]), sendMessage: () => {} },
+        sidePanel: { setPanelBehavior: () => {} }
+      };
+
+      // Seeded before anything reads it: three houses, one per strategy, so the board shows
+      // a mixed set the way a real user's would look.
+      const HOUSES = [
+        {
+          source: 'zillow', address: '1428 N Maplewood Ave, Chicago, IL 60622',
+          price: '$525,000', beds: '4', baths: '2.5', sqft: '2,100',
+          propertyID: '2087341', url: 'https://www.zillow.com/homedetails/2087341_zpid/',
+          latitude: 41.9075, longitude: -87.6889, hoa: 0, rev: 1, lastWriter: 'capture',
+          localParams: { mode: 'rental', sliderValue: 3400, monthlyRent: 3400 }
+        },
+        {
+          source: 'redfin', address: '812 W 18th St, Austin, TX 78701',
+          price: '$389,000', beds: '3', baths: '2', sqft: '1,540',
+          propertyID: '5541902', url: 'https://www.redfin.com/TX/Austin/812-W-18th-St/home/5541902',
+          latitude: 30.2801, longitude: -97.7501, hoa: 0, rev: 1, lastWriter: 'capture',
+          localParams: { mode: 'flip', rehabBudget: 65000, arv: 545000, holdMonths: 6 }
+        },
+        {
+          source: 'zillow', address: '3390 SE 12th Pl, Cape Coral, FL 33904',
+          price: '$268,500', beds: '3', baths: '2', sqft: '1,320',
+          propertyID: '7710455', url: 'https://www.zillow.com/homedetails/7710455_zpid/',
+          latitude: 26.5629, longitude: -81.9495, hoa: 45, rev: 1, lastWriter: 'capture',
+          localParams: { mode: 'brrrr', rehabBudget: 42000, arv: 355000, monthlyRent: 2450, sliderValue: 2450 }
+        }
+      ];
+      store.storedHouses = HOUSES;
+      store.undoLog = [];
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      // Worker first, so its handlers are registered before the panel can send anything.
+      await import('/scripts/background.js');
+      await import('/assets/index.js');
+      window.__harnessReady = true;
+    </script>
+  </body>
+</html>

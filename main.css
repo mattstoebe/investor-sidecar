@@ -1,0 +1,22 @@
+html body{
+    background: url(https://th.bing.com/th/id/R.41a1f6c09a9784894778fe588c0a480b?rik=YMgya6vY9arfPA&riu=http%3a%2f%2fclipart-library.com%2fnewhp%2f8-86626_house-hd-clipart-house-free-clipart-house-clipart.png&ehk=FEYXB8tn3ip%2bkvhYnViu%2bYHvbZKQoeYpBaCBUg%2fvKBA%3d&risl=&pid=ImgRaw&r=0);
+}
+.rental-bubble {
+    background-color: rgba(0, 0, 0, 0.7);
+    color: white;
+    border-radius: 5px;
+    padding: 10px;
+    position: absolute;
+    z-index: 100;
+    display: none; /* Hidden by default */
+    width: 200px; /* Fixed width */
+}
+
+#houseContainer li {
+    position: relative; /* Relative positioning for bubbles */
+}
+
+/* Show the bubble when hovering over the rental item */
+#houseContainer li:hover .rental-bubble {
+    display: block; /* Show on hover */
+}

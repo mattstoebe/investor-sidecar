@@ -1,0 +1,38 @@
+{
+    "manifest_version": 3,
+    "version": "1.0.0",
+    "name": "Investor Sidecar",
+    "description": "Analyze buy-and-hold, fix-and-flip and BRRRR deals on Redfin and Zillow listings, in a side panel.",
+    "permissions": ["storage", "sidePanel"],
+    "host_permissions": ["https://*.redfin.com/*", "https://*.zillow.com/*"],
+    "icons": {
+        "16": "images/icon-16.png",
+        "48": "images/icon-48.png",
+        "128": "images/icon-128.png"
+    },
+    "action": {
+        "default_icon": {
+            "16": "images/icon-16.png",
+            "48": "images/icon-48.png",
+            "128": "images/icon-128.png"
+        }
+    },
+    "background": {
+        "service_worker": "scripts/background.js",
+        "type": "module"
+    },
+    "content_scripts": [
+        {
+            "js": [
+                "scripts/sites/parsers.js",
+                "scripts/sites/redfin.js",
+                "scripts/sites/zillow.js",
+                "scripts/content.js"
+            ],
+            "matches": ["https://*.redfin.com/*", "https://*.zillow.com/*"]
+        }
+    ],
+    "side_panel": {
+        "default_path": "index.html"
+    }
+}

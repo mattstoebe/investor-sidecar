@@ -1,0 +1,80 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  transition: background-color 0.3s ease, color 0.3s ease;
+  @apply bg-gray-100;
+}
+
+body.dark {
+  @apply bg-gray-900;
+  color-scheme: dark;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  background: #ed1d1d;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+input[type="range"]::-ms-thumb {
+  width: 16px;
+  height: 16px;
+  background: #ed1d1d;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.dark input[type="range"] {
+  background-color: #374151;
+}
+
+.dark input[type="range"]::-webkit-slider-thumb {
+  background: #ef4444;
+}
+
+.dark input[type="range"]::-moz-range-thumb {
+  background: #ef4444;
+}
+
+.dark input[type="range"]::-ms-thumb {
+  background: #ef4444;
+}
+
+.dark input[type="number"],
+.dark input[type="text"] {
+  @apply bg-gray-800 border-gray-700 text-white;
+}
+
+*,
+::before,
+::after {
+  transition: background-color 0.3s ease, border-color 0.3s ease;
+}
+
+#root {
+  min-height: 100vh;
+  @apply bg-gray-100 dark:bg-gray-900;
+  transition: background-color 0.3s ease;
+}

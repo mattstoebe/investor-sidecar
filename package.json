@@ -1,0 +1,46 @@
+{
+  "name": "investor-sidecar",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "package": "npm run build && cd dist && zip -r -FS ../investor-sidecar-$npm_package_version.zip . -x '.*' -x '__MACOSX'",
+    "harness": "npm run build && cp tools/panel-harness.html dist/ && echo 'Serving panel harness at http://127.0.0.1:8899/panel-harness.html (ctrl-c to stop)' && cd dist && python3 -m http.server 8899"
+  },
+  "dependencies": {
+    "@types/xlsx": "^0.0.35",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-icons": "^5.4.0",
+    "recharts": "^2.15.1",
+    "rippleui": "^1.12.1",
+    "style": "^0.0.3",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@types/chrome": "^0.0.299",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.x",
+    "eslint": "^9.17.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "eslint-plugin-react-refresh": "^0.4.16",
+    "globals": "^15.14.0",
+    "jsdom": "^27.0.1",
+    "postcss": "^8.x",
+    "tailwindcss": "^3.x",
+    "typescript": "~5.6.2",
+    "typescript-eslint": "^8.18.2",
+    "vite": "^6.0.5",
+    "vitest": "^3.0.4"
+  }
+}
