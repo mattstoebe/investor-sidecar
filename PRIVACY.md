@@ -2,8 +2,9 @@
 
 _Last updated: 27 July 2026_
 
-Investor Sidecar is a Chrome extension that calculates rental-property cash flow for
-listings you choose to save while browsing Redfin and Zillow.
+Investor Sidecar is a Chrome extension that analyzes real-estate investment deals — buy and
+hold, fix and flip, and BRRRR — for listings you choose to save while browsing Redfin and
+Zillow.
 
 ## Short version
 

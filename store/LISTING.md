@@ -8,8 +8,15 @@ the 800×800 master the runtime icons in `public/images/` were resized from.
 
 - One-time $5 developer registration at
   <https://chrome.google.com/webstore/devconsole> (needed once per Google account).
-- Host `PRIVACY.md` at a public URL and paste that URL into the listing. GitHub Pages on
-  this repo is enough; the store rejects a policy that is only a file in a repo.
+- Privacy policy URL — **done**, paste this into the listing and the data-disclosure form:
+
+  ```
+  https://mattstoebe.github.io/investor-sidecar/PRIVACY
+  ```
+
+  Served by GitHub Pages from `PRIVACY.md` on `main` (see `_config.yml`). It has to be a
+  reachable URL: the store rejects a policy that is only a file in a repository. Editing
+  `PRIVACY.md` and pushing republishes it within a minute or two.
 
 ## Build the upload
 
