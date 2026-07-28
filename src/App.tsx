@@ -831,6 +831,12 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
   const missing = missingRequirement(mode, overrides);
 
   const pickMode = async (next: ModeId | null) => {
+    // Land what is being typed before switching. Edits are debounced and the mode write is
+    // not, so the switch used to arrive first; the card then sees a foreign write and drops
+    // its pending edit by design, and the number entered a moment earlier disappeared.
+    // Values for fields the new mode doesn't show stay in storage and come back on a switch
+    // back -- nothing is lost by switching, which is the point.
+    await commit();
     try {
       const response = await chrome.runtime.sendMessage({
         action: 'updateLocalParams',
@@ -1315,7 +1321,20 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
 
       {/* No summary footer: it repeated Cash Flow and Cash-on-Cash, which the verdict
           strip above already shows on every card. */}
-      {openSection && renderSection(MODES[mode].sections.find((s) => s.id === openSection)!)}
+      {/*
+        Looked up, not asserted. Section ids are per-mode -- rental has rent and expenses, flip
+        has rehab and resale -- and `openSection` outlives a mode switch, so after switching
+        with a non-shared section open this find returns undefined. It used to carry a `!`,
+        and dereferencing that undefined threw during render, which unmounts the entire panel
+        rather than one card: a blank side panel from switching strategy mid-edit.
+
+        Deliberately not cleared when it goes stale. Nothing renders open and every chevron
+        reads closed, and switching back restores the section the user had open.
+      */}
+      {openSection && (() => {
+        const section = MODES[mode].sections.find((s) => s.id === openSection);
+        return section ? renderSection(section) : null;
+      })()}
     </div>
   )
 }

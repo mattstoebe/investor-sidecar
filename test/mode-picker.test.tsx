@@ -285,3 +285,86 @@ describe('a card showing a BRRRR', () => {
     expect(screen.queryByTestId('toggle-operating')).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Switching strategy while a dropdown is open, or mid-edit.
+ *
+ * Reported together from a real session: numbers were being typed into an open dropdown when
+ * the strategy was switched, and the whole panel went blank.
+ *
+ * Both need the worker's broadcast to be simulated, not just the click. Clicking a tile only
+ * sends a message; the mode actually changes when the worker writes it and re-broadcasts the
+ * house, which reaches the card as a new prop with a bumped `rev` and a foreign `lastWriter`.
+ * A test that stops at the click passes against both bugs.
+ */
+const broadcastOf = (h: House, mode: string, rev = (h.rev ?? 0) + 1): House =>
+  ({ ...h, rev, lastWriter: 'mode-picker', localParams: { ...h.localParams, mode } } as House);
+
+describe('switching strategy mid-edit', () => {
+  // Section ids are per-mode -- rental has rent/expenses, flip has rehab/resale -- and the open
+  // section outlives the switch. Looking a stale id up returns undefined, which was then
+  // dereferenced during render, taking the whole panel down rather than one card.
+  it('survives a switch to a mode that does not have the open section', () => {
+    ready();
+    const h = house();
+    const { rerender } = render(<HouseCard house={h} globalParams={globalParams} />);
+
+    fireEvent.click(screen.getByTestId('toggle-income'));
+    expect(screen.getByTestId('rent-field')).toBeInTheDocument();
+
+    rerender(<HouseCard house={broadcastOf(h, 'flip')} globalParams={globalParams} />);
+
+    // The crash unmounted the tree, so the card itself went missing.
+    expect(screen.getByTestId('house-card')).toBeInTheDocument();
+    expect(screen.getByTestId('mode-chip')).toHaveTextContent('Fix and flip');
+  });
+
+  it('survives every pair of strategies with a non-shared section open', () => {
+    for (const [from, to, toggle] of [
+      ['rental', 'flip', 'toggle-expenses'],
+      ['rental', 'brrrr', 'toggle-expenses'],
+      ['flip', 'rental', 'toggle-rehab'],
+      ['flip', 'brrrr', 'toggle-resale'],
+      ['brrrr', 'flip', 'toggle-refinance'],
+      ['brrrr', 'rental', 'toggle-operating']
+    ] as const) {
+      ready();
+      const h = house({
+        localParams: { sliderValue: 2800, mode: from, arv: 500000, rehabBudget: 40000 }
+      });
+      const { rerender, unmount } = render(<HouseCard house={h} globalParams={globalParams} />);
+      fireEvent.click(screen.getByTestId(toggle));
+      rerender(<HouseCard house={broadcastOf(h, to)} globalParams={globalParams} />);
+      expect(screen.getByTestId('house-card'), `${from} -> ${to}`).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  /**
+   * The switch discarded whatever had been typed but not yet saved. Edits are debounced, the
+   * mode write is not, so the mode landed first; the card then saw a foreign write and dropped
+   * its pending edit by design. The number just typed vanished.
+   *
+   * Asserted as an ordering rather than "was it eventually sent", because the debounce would
+   * send it a moment later on its own and hide the bug.
+   */
+  it('saves a number typed a moment earlier before switching away from it', async () => {
+    ready();
+    render(<HouseCard house={house({ localParams: {} })} globalParams={globalParams} />);
+
+    fireEvent.change(screen.getByTestId('rent-field'), { target: { value: '3175' } });
+    fireEvent.click(screen.getByTestId('mode-chip'));
+    fireEvent.click(screen.getByTestId('mode-tile-brrrr'));
+
+    await waitFor(() => expect(sentModeUpdates().length).toBeGreaterThan(0));
+
+    const sent = vi.mocked(chrome.runtime.sendMessage).mock.calls
+      .map(([msg]) => msg as { localParams?: Record<string, unknown> });
+    const rentAt = sent.findIndex((m) => m?.localParams?.sliderValue === 3175);
+    const modeAt = sent.findIndex((m) => m?.localParams && 'mode' in m.localParams);
+
+    expect(rentAt, 'the rent typed before the switch was never sent').toBeGreaterThanOrEqual(0);
+    expect(rentAt, 'the rent must be saved before the switch, or the switch discards it')
+      .toBeLessThan(modeAt);
+  });
+});

@@ -150,13 +150,20 @@ export function useHouseParams(house: House) {
     timer.current = setTimeout(() => { void flush(); }, SAVE_DEBOUNCE_MS);
   }, [flush]);
 
-  /** Ends an edit session early -- wired to blur, so leaving a field saves it now. */
+  /**
+   * Ends an edit session early -- wired to blur, so leaving a field saves it now.
+   *
+   * Returns the write so a caller that is about to cause a *foreign* write can await it. The
+   * mode picker has to: its write is not this card's, so adoption drops any pending edit, and
+   * a number typed within the debounce window would be discarded by the switch. Blur handlers
+   * ignore the promise, which is fine.
+   */
   const commit = useCallback(() => {
     if (timer.current) {
       clearTimeout(timer.current);
       timer.current = undefined;
     }
-    void flush();
+    return flush();
   }, [flush]);
 
   // Adopt writes this card did not make. Anything it did make is skipped, but its revision is
