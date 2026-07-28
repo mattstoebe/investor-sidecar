@@ -1,0 +1,31 @@
+# GitHub Pages config. This site exists for one required reason: the Chrome Web Store
+# will not accept a data-disclosure form without a publicly reachable privacy policy, and
+# a file inside a repository does not count. PRIVACY.md is served at /PRIVACY.
+theme: jekyll-theme-cayman
+title: Investor Sidecar
+description: Analyze buy-and-hold, fix-and-flip and BRRRR deals on Redfin and Zillow listings, in a side panel.
+
+# Only the prose is published. Everything else is source: it stays readable on GitHub, but
+# there is no reason to also serve it as a website.
+include:
+  - PRIVACY.md
+exclude:
+  - src
+  - public
+  - test
+  - tools
+  - dist
+  - node_modules
+  - .github
+  - package.json
+  - package-lock.json
+  - tsconfig.json
+  - tsconfig.app.json
+  - tsconfig.node.json
+  - vite.config.ts
+  - eslint.config.js
+  - postcss.config.js
+  - tailwind.config.js
+  - index.html
+  - main.css
+  - styles.css
