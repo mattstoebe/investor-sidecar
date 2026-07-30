@@ -46,7 +46,9 @@ export interface Comp {
    * What the site called the number. Non-disclosure states (TX) never show a sold price;
    * `last-list` is the honest fallback and must render distinctly from a real sold price.
    */
-  amountLabel: 'rent' | 'sold' | 'last-list';
+  amountLabel: 'rent' | 'list' | 'sold' | 'last-list';
+  /** Sale comps may be active listings; missing means a legacy sold comp. */
+  listingStatus?: 'active' | 'sold';
   beds: string;
   baths: string;
   sqft: string;
@@ -55,6 +57,14 @@ export interface Comp {
   soldDate?: string | null;
   capturedAt: number;
 }
+
+type CompSearchSource = 'redfin' | 'zillow' | 'homes';
+
+const COMP_SEARCH_SOURCES: Array<{ id: CompSearchSource; label: string; className: string }> = [
+  { id: 'redfin', label: 'Redfin', className: 'text-red-600 dark:text-red-400' },
+  { id: 'zillow', label: 'Zillow', className: 'text-blue-600 dark:text-blue-400' },
+  { id: 'homes', label: 'Homes', className: 'text-emerald-600 dark:text-emerald-400' }
+];
 
 export interface House {
   /** Which site this was captured from. Absent on records saved before multi-site
@@ -181,9 +191,6 @@ export const DEFAULT_GLOBAL_PARAMETERS: GlobalParameters = {
   mode: DEFAULT_MODE,
   isDarkMode: false,
   propertyTaxRate: null,
-  // The four rent-scaled rates default to 0 so a fresh capture's expenses are only the
-  // bills we can actually name (tax, insurance, HOA, debt service). Non-zero defaults made
-  // every expense line move as rent was typed, which read as the calculator inventing costs.
   vacancyRate: 0,
   maintenanceRate: 0,
   capExRate: 0,
@@ -201,46 +208,16 @@ export const DEFAULT_GLOBAL_PARAMETERS: GlobalParameters = {
   paramsVersion: CURRENT_PARAMS_VERSION
 };
 
-/** The four rates that scale with rent, zeroed together by the v2 migration. */
 const RENT_SCALED_RATE_KEYS = ['vacancyRate', 'maintenanceRate', 'capExRate', 'managementRate'] as const;
 
-/**
- * Brings stored assumptions up to CURRENT_PARAMS_VERSION.
- *
- * The load path spreads defaults *under* stored values, which is what lets a new field
- * appear without wiping a saved panel -- but it also means a changed default never reaches
- * anyone who has stored settings, and a changed *unit* would be read wrong forever.
- *
- * v2 does two things:
- *  - Zeroes the four rent-scaled rates unconditionally (chosen over matching the old
- *    defaults: simpler, and guaranteed to take effect).
- *  - Rescales a legacy fractional interest rate. Older builds stored the rate as a
- *    fraction -- the input did `parseFloat(value) / 100` and displayed `value * 100` --
- *    and the mortgage class divided by 12 directly. This one divides by 100 first, so a
- *    stored 0.07 would be read as 0.07%, collapsing P&I to roughly loanAmount/360 and
- *    making every cash-flow, CoC and DSCR figure wildly optimistic. Silently wrong
- *    numbers are the worst failure this panel can have, so it is corrected on read.
- *
- * Per-house overrides in localParams are left alone: those were already stored as whole
- * percentages (the per-house input never divided by 100), so they need no rescaling.
- *
- * v3 moves the card metric selection under the mode it belongs to. It was one flat array,
- * which was only ever a rental selection -- there was nothing else it could be -- so it
- * becomes that mode's entry and every other mode falls back to its own defaults.
- */
 export function migrateGlobalParams(stored: Partial<GlobalParameters>): GlobalParameters {
   const merged = { ...DEFAULT_GLOBAL_PARAMETERS, ...stored };
   if ((stored.paramsVersion ?? 0) < 2) {
     for (const key of RENT_SCALED_RATE_KEYS) merged[key] = 0;
-    // A rate in (0, 1) can only be the old fraction: no real mortgage is under 1%, and
-    // the pre-v2 default was 0.07. Bounded to the one-time migration so a user who
-    // deliberately types 0.5% later is never second-guessed.
     if (merged.interestRate > 0 && merged.interestRate < 1) {
       merged.interestRate *= 100;
     }
   }
-  // Tested by shape rather than by version: a stored array is unambiguously pre-v3, and
-  // keying off that survives a record whose paramsVersion was lost or hand-edited.
   if (Array.isArray(merged.cardMetrics)) {
     merged.cardMetrics = { rental: merged.cardMetrics as MetricKey[] };
   } else if (!merged.cardMetrics || typeof merged.cardMetrics !== 'object') {
@@ -251,7 +228,6 @@ export function migrateGlobalParams(stored: Partial<GlobalParameters>): GlobalPa
   return merged;
 }
 
-/** The metrics a card in this mode should show, validated against what the mode offers. */
 export function cardMetricsFor(params: GlobalParameters, mode: ModeId): MetricKey[] {
   const definition = MODES[mode];
   return resolveCardMetrics(
@@ -261,10 +237,6 @@ export function cardMetricsFor(params: GlobalParameters, mode: ModeId): MetricKe
   );
 }
 
-/** Mirrors houseKey() in background.js: both sites use bare digits, so the source
- *  must be part of a house's identity or a zpid could collide with a Redfin id. */
-/** Display names for the sites we capture from. Keyed the same way houseKey defaults:
- *  records saved before multi-site support carry no source and were all Redfin. */
 const SITE_NAMES: Record<'redfin' | 'zillow' | 'homes', string> = {
   redfin: 'Redfin',
   zillow: 'Zillow',
@@ -274,7 +246,6 @@ const SITE_NAMES: Record<'redfin' | 'zillow' | 'homes', string> = {
 export const houseKey = (house: Pick<House, 'propertyID'> & { source?: string }) =>
   `${house.source || 'redfin'}:${house.propertyID}`;
 
-/** Mirrors compKey() in house-storage.js -- same duplication, same reason. */
 const compKey = (comp: Comp) => `${comp.source}:${comp.propertyID}:${comp.kind}`;
 
 const formatMoney = (value: number) =>
@@ -283,13 +254,6 @@ const formatMoney = (value: number) =>
 const formatPercent = (value: number | null, digits = 1) =>
   value === null || !Number.isFinite(value) ? '—' : `${value.toFixed(digits)}%`;
 
-/**
- * Canonical price for display. Adapters emit whatever their source provides --
- * Redfin's scraped "$975,000" but Zillow's ld+json numeric 774950 -- and rendering
- * the raw string showed "774950" with no currency symbol or separators. Formatting
- * here keeps every card consistent no matter which site it came from, and falls back
- * to the original text when it isn't a number at all.
- */
 const displayPrice = (raw: string | number | null | undefined) => {
   const parsed = parseMoney(raw);
   if (parsed !== null) return `$${parsed.toLocaleString()}`;
@@ -297,20 +261,6 @@ const displayPrice = (raw: string | number | null | undefined) => {
   return text || '—';
 };
 
-/**
- * Backs every numeric input in the panel. The naive version -- parse the typed
- * text to a number immediately and feed that number back as the controlled
- * `value` -- can't be typed into: type "0" then "." and the input's value becomes
- * Number("0.") = 0, which renders back as "0", silently eating the decimal point
- * you just typed before you can add anything after it. Same failure for a bare
- * "-" while starting a negative number, or a trailing "0" in "1.50".
- *
- * This keeps its own text buffer that mirrors exactly what's on screen, and only
- * overwrites it from the external value when that value changed for a reason
- * other than this input's own onChange (switching to a different house, a reset
- * button) -- tracked via lastEmitted so a round-trip through our own callback
- * never fights the keystroke that caused it.
- */
 function useNumericTextBuffer(
   value: number | null,
   onChange: (value: number | null) => void,
@@ -318,8 +268,6 @@ function useNumericTextBuffer(
     min?: number;
     max?: number;
     format?: (value: number) => string;
-    /** Called once the field is done being edited, so the save can be coalesced per edit
-     *  session rather than fired per keystroke. See useHouseParams. */
     onCommit?: () => void;
   } = {}
 ) {
@@ -332,17 +280,12 @@ function useNumericTextBuffer(
       setText(display(value));
       lastEmitted.current = value;
     }
-    // display/format intentionally excluded: it's a stable formatting function, not
-    // a value this effect should resync on.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
   const handleInput = (raw: string) => {
     setText(raw);
 
-    // Strip formatting a user might leave in place while editing a blur-formatted
-    // value in place (e.g. tweaking one digit of "$450,000" without clearing it
-    // first) -- harmless for plain-number fields, since none of them use $ or ,.
     const cleaned = raw.trim().replace(/[$,\s]/g, '');
     if (cleaned === '' || cleaned === '-') {
       lastEmitted.current = null;
@@ -351,8 +294,6 @@ function useNumericTextBuffer(
     }
 
     const parsed = Number(cleaned);
-    // Mid-typing states ("5-", "0..", "1e") aren't valid numbers yet -- keep
-    // showing what was typed but don't propagate anything for them.
     if (!Number.isFinite(parsed)) return;
 
     let clamped = parsed;
@@ -362,18 +303,6 @@ function useNumericTextBuffer(
     onChange(clamped);
   };
 
-  /**
-   * Reconciles the display with the value actually committed, once the user has finished
-   * editing rather than fighting every keystroke with a formatted re-render.
-   *
-   * The reconciliation matters as much as the formatting: handleInput clamps to min/max but
-   * leaves the typed text alone, so typing 150 into a field capped at 100 showed "150"
-   * indefinitely while the model used 100. A field that disagrees with the math is worse
-   * than one that rejects input.
-   *
-   * Only resyncs when the text and the committed value genuinely disagree, so a deliberate
-   * "1.50" isn't rewritten to "1.5" just for passing through here.
-   */
   const handleBlur = () => {
     const committed = lastEmitted.current;
     const cleaned = text.trim().replace(/[$,\s]/g, '');
@@ -387,23 +316,12 @@ function useNumericTextBuffer(
     } else {
       setText(display(committed));
     }
-    // After reconciling, not before: leaving the field is what ends the edit session, and
-    // the value being saved should be the one now on screen.
     onCommit?.();
   };
 
   return { text, handleInput, handleBlur };
 }
 
-/**
- * Any assumption field, rendered from its registry entry.
- *
- * This is what makes a mode's inputs declarative: a mode lists the keys its sections expose
- * and the card renders them, instead of every field being a hand-written row. A field with a
- * panel default behaves as an override (empty means inherit, shown as the default in grey);
- * one without -- an after-repair value, a rehab budget -- is per-house by nature and shows its
- * own placeholder, because there is no credible global for it to fall back to.
- */
 function ParamField({
   paramKey, value, globals, onChange, onCommit, testId, placeholder
 }: {
@@ -412,9 +330,7 @@ function ParamField({
   globals: GlobalParameters;
   onChange: (value: number | null) => void;
   onCommit?: () => void;
-  /** Defaults below; passed explicitly only where a legacy id is worth keeping. */
   testId?: string;
-  /** Overrides the registry's, for a field whose hint is per-house (the listing's own price). */
   placeholder?: string;
 }) {
   const def = PARAMS[paramKey];
@@ -431,8 +347,6 @@ function ParamField({
 
   return (
     <div className="flex items-center gap-2">
-      {/* Only fields that *can* inherit get the dot -- on a per-house-only field there is no
-          inherited state for it to distinguish, so it would always be lit and mean nothing. */}
       {inherited !== null && (
         <span
           title={isOverridden ? 'Overridden for this house' : 'Inherited from global defaults'}
@@ -445,8 +359,6 @@ function ParamField({
       <input
         type="text"
         inputMode="decimal"
-        // Percent fields keep the id they had as hardcoded rows, so the typing and clamping
-        // suites still address them; they are the same field, rendered from a registry.
         data-testid={testId ?? (def.unit === 'percent' ? `rate-field-${def.label}` : `param-${paramKey}`)}
         className={`border rounded p-1 text-sm text-right shrink-0 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 ${
           isMoney ? 'w-24' : 'w-14'
@@ -461,7 +373,6 @@ function ParamField({
   );
 }
 
-/** A single global-assumption input: a plain number with a unit suffix, no override concept -- this *is* the default. */
 function GlobalNumberField({
   id, label, value, onChange, max, suffix = '%', placeholder
 }: {
@@ -473,13 +384,9 @@ function GlobalNumberField({
   suffix?: string | null;
   placeholder?: string;
 }) {
-  // Same reason as ParamField: an unreconciled clamp leaves the field showing a
-  // number the math isn't using.
   const { text, handleInput, handleBlur } = useNumericTextBuffer(value, onChange, { min: 0, max });
   return (
     <div className="flex flex-col">
-      {/* Fixed label height keeps every input in the 2-column grid on the same
-          baseline even when one label wraps and its neighbour doesn't. */}
       <label htmlFor={id} className="mb-1 text-xs leading-tight text-gray-600 dark:text-gray-400 min-h-[2rem] flex items-end">{label}</label>
       <div className="relative">
         <input
@@ -498,25 +405,6 @@ function GlobalNumberField({
   );
 }
 
-/**
- * One glanceable stat in the card's verdict strip. Label and value sit on the same
- * baseline rather than stacked: stacked chips in a 2x2 grid cost the card 80-100px of
- * height, and these cards are meant to be skimmed inline, not read.
- */
-/**
- * One headline figure, label above value.
- *
- * Label and value used to sit on one line, with the label shrink-0 and the value truncate --
- * so when three chips didn't fit, the *value* was what gave way. At 360px that rendered
- * "MAO $316..." and "LEFT IN $63,7...", and a clipped dollar figure is worse than a missing
- * one: it reads as a real, much smaller number. The labels, which are the part you can infer
- * from context, kept their full width throughout.
- *
- * Stacking gives the value the whole column instead of the remainder of one. Measured on the
- * widest case (flip: MAO $316,500 / PROFIT $29,607) it clears at 280px, below any width the
- * side panel can actually be dragged to. truncate stays on the value as a backstop for
- * pathological numbers, but it is no longer load-bearing at ordinary widths.
- */
 function StatChip({ label, value, tone = 'neutral', testId }: {
   label: string;
   value: string;
@@ -533,8 +421,6 @@ function StatChip({ label, value, tone = 'neutral', testId }: {
   );
 }
 
-/** A read-only figure in the card's summary rows. Plain text, not a disabled input -- an
- *  input at panel width clipped values like "$2,570.89" mid-digit. */
 function ReadOnlyRowValue({ value }: { value: string }) {
   return (
     <span className="flex-1 min-w-0 text-sm text-right tabular-nums text-gray-700 dark:text-gray-300 truncate">
@@ -779,7 +665,9 @@ function CompSummary({ comps, onPick, onRemove }: {
           </a>
           <span className="text-gray-500 dark:text-gray-400 shrink-0 tabular-nums">
             ${comp.amount.toLocaleString()}{comp.kind === 'rent' ? '/mo' : ''}
-            {comp.amountLabel === 'last-list' ? ' (list)' : ''}
+            {comp.amountLabel === 'list' ? ' (active list)' : ''}
+            {comp.amountLabel === 'last-list' ? ' (last list)' : ''}
+            {comp.amountLabel === 'sold' ? ' (sold)' : ''}
           </span>
           <button
             type="button"
@@ -795,15 +683,38 @@ function CompSummary({ comps, onPick, onRemove }: {
   );
 }
 
+/** Source picker for a comp hunt. Sessions are attached to the subject house, not the
+ * search provider, so any supported site can contribute comps to the same card. */
+function CompSearchLinks({ kind, subjectSource, onStart }: {
+  kind: 'rent' | 'sold';
+  subjectSource: CompSearchSource;
+  onStart: (source: CompSearchSource) => void;
+}) {
+  const label = kind === 'rent' ? 'rent' : 'sale';
+  return (
+    <div className="flex items-center gap-2 text-xs" aria-label={`Find ${label} comps on a site`}>
+      {COMP_SEARCH_SOURCES.map((source) => (
+        <button
+          key={source.id}
+          type="button"
+          title={`Find ${label} comps on ${source.label}`}
+          aria-label={`Find ${label} comps on ${source.label}`}
+          data-testid={`find-${label}-comps-${source.id}`}
+          className={`${source.className} hover:underline ${source.id === subjectSource ? 'font-semibold underline underline-offset-2' : ''}`}
+          onClick={() => onStart(source.id)}
+        >
+          {source.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highlighted }: {
   house: House,
   globalParams: GlobalParameters,
-  /** Lets the panel offer to undo the removal; the card itself has no toast. */
   onRemoved?: (address: string) => void,
-  /** Same, for a strategy switch -- the other thing worth taking back. */
   onModeChanged?: (label: string) => void,
-  /** Set for a moment after clicking this house's pin on the site's own map
-   *  (docs/map-linking.md Option 3) -- see the highlightHouse listener in App(). */
   highlighted?: boolean
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
@@ -811,29 +722,16 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
     if (highlighted) cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }, [highlighted]);
 
-  // One open section, keyed by id. Three independent booleans could not survive a mode with
-  // four sections, and let two dropdowns be open at once on a 320px panel.
   const [openSection, setOpenSection] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(true);
   const [predictedRent, setPredictedRent] = useState<RentEstimate | null>(house.rentEstimate ?? null);
-  // TODO(rent-model): house.rentError was mirrored into state and rendered; nothing displays
-  // it while there's no rent service. The field is still written by background.js.
 
-  // Every per-house override, plus when they reach storage and when an incoming write may
-  // replace them. See src/useHouseParams.ts -- the card no longer owns any of that.
   const { params, setParam, commit } = useHouseParams(house);
-  // Absent means the card has never touched this field, which reads the same as inheriting.
   const at = (key: ParamKey) => params[key] ?? null;
   const sliderValue = at('monthlyRent') ?? 0;
   const localPrice = at('price');
 
-  // Hoisted here (not inside renderDropdownContent) because hooks can't be called
-  // conditionally, and that function only runs when its dropdown is open.
   const dollarFormat = (v: number) => `$${v.toLocaleString()}`;
-  // Deliberately no max: the old version clamped rent to getRentBounds() on every
-  // keystroke, and those bounds are derived from price (min = 0.1% of price, max = 1%).
-  // On a $400k house that meant typing "2" snapped to $400, the next digit appended
-  // to the snapped value, and the field filled with numbers the user never typed.
-  // Bounds are for the slider and chart; the text field accepts any rent.
   const rentBuffer = useNumericTextBuffer(
     sliderValue === 0 ? null : sliderValue,
     (value) => setParam('monthlyRent', value ?? 0),
@@ -851,12 +749,6 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
     </svg>
   );
 
-  // Seeds the rent field from a fresh estimate, but only when the user has not set one --
-  // an estimate arriving must never overwrite a number they typed.
-  //
-  // The tax-rate half of this effect is gone: it existed because card state was write-once at
-  // mount and so could not see enrichment land. useHouseParams adopts foreign writes for every
-  // field now, and readLocalParams still falls back to house.apiTaxRate on first read.
   useEffect(() => {
     setPredictedRent(house.rentEstimate ?? null);
     if (house.rentEstimate && sliderValue === 0) {
@@ -864,15 +756,10 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
     }
   }, [house.rentEstimate, sliderValue, setParam]);
 
-  // Which strategy this house is being evaluated under. Same override-wins rule as every
-  // other parameter; with one mode registered this always resolves to 'rental'.
   const mode = resolveMode(house.localParams?.mode ?? null, globalParams.mode).value;
 
-  // Straight from what the card holds: the registry is the contract, so a mode's new field
-  // needs no edit here.
   const overrides: ModeOverrides = params;
 
-  // One analysis per render. Either it succeeded, or it carries a reason we show the user.
   const result = useMemo(
     () => MODES[mode].analyze({
       house: { price: house.price, hoa: house.hoa, sqft: house.sqft },
@@ -882,22 +769,12 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
     [house.price, house.hoa, house.sqft, overrides, globalParams, mode]
   );
 
-  // Whatever this mode produced. The metric strip reads it through the mode's own metric
-  // definitions, which is what makes it safe to hold the union here.
   const analysis = result.ok ? result.analysis.detail : null;
-  // Break-even rent is the one figure still genuinely rental-only: it inverts a cash-flow
-  // model whose debt service is fixed, which a BRRRR's is not until after the refinance.
   const rental = result.ok && result.analysis.mode === 'rental' ? result.analysis.detail : null;
-  /**
-   * The stabilized-operations view, for any mode that has one. A flip never does -- nobody
-   * lives in it -- but a BRRRR's post-refinance operations are a rental's by construction,
-   * which is what lets both render the same expense waterfall.
-   */
   const operating: OperatingBreakdown | null = result.ok
     && (result.analysis.mode === 'rental' || result.analysis.mode === 'brrrr')
     ? result.analysis.detail
     : null;
-  /** The lines below NOI, which are the part that genuinely differs by strategy. */
   const financing = !result.ok ? null
     : result.analysis.mode === 'rental' ? {
       costs: [
@@ -919,7 +796,6 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
           { label: 'DSCR', text: result.analysis.detail.refiDscr !== null ? `${result.analysis.detail.refiDscr.toFixed(2)}x` : EM_DASH },
           {
             label: 'Return on cash left in',
-            // No capital left is the strategy working, not a missing number.
             text: result.analysis.detail.postRefiCoC === null
               ? (result.analysis.detail.cashLeftInDeal <= 0 ? 'All capital returned' : EM_DASH)
               : formatPercent(result.analysis.detail.postRefiCoC)
@@ -932,7 +808,6 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
         ]
       }
         : null;
-  // The figures that mean the same thing under every strategy, labelled for the one in use.
   const summary = result.ok
     ? {
       ...result.analysis.summary,
@@ -940,23 +815,15 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
     }
     : null;
   const analysisReason = result.ok ? null : result.reason;
-  /** What this mode still needs before it can say anything, if anything. */
   const missing = missingRequirement(mode, overrides);
 
   const pickMode = async (next: ModeId | null) => {
-    // Land what is being typed before switching. Edits are debounced and the mode write is
-    // not, so the switch used to arrive first; the card then sees a foreign write and drops
-    // its pending edit by design, and the number entered a moment earlier disappeared.
-    // Values for fields the new mode doesn't show stay in storage and come back on a switch
-    // back -- nothing is lost by switching, which is the point.
     await commit();
     try {
       const response = await chrome.runtime.sendMessage({
         action: 'updateLocalParams',
         propertyID: house.propertyID,
         source: house.source,
-        // Deliberately not this card's writer id: the switch changes which fields exist, and
-        // the card should re-read rather than hold state from the strategy it just left.
         writer: 'mode-picker',
         localParams: { mode: next }
       });
@@ -969,31 +836,36 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
       console.error('Error changing strategy:', error);
     }
   };
-  // Sanitised here rather than trusting storage: a stale or hand-edited selection, or one
-  // belonging to a different strategy, would otherwise index a metric this mode cannot render.
   const cardMetrics = useMemo(() => cardMetricsFor(globalParams, mode), [globalParams, mode]);
   const metricDefs = useMemo(() => {
     const byKey = new Map(MODES[mode].metrics.map((metric) => [metric.key, metric]));
     return cardMetrics.map((key) => byKey.get(key)!).filter(Boolean);
   }, [cardMetrics, mode]);
+  const primaryMetric = metricDefs[0];
+  const primaryTone: StatTone = analysis !== null && missing === null && primaryMetric
+    ? primaryMetric.tone(analysis)
+    : 'neutral';
+  const primaryToneDotClasses: Record<StatTone, string> = {
+    good: 'bg-emerald-500',
+    warn: 'bg-amber-400',
+    bad: 'bg-red-500',
+    neutral: 'bg-gray-300 dark:bg-gray-600'
+  };
+  const primaryMetricStatus = primaryTone === 'neutral'
+    ? 'Primary metric is not ready'
+    : `${primaryMetric?.longLabel ?? 'Primary metric'} is ${primaryTone}`;
 
-  // Split once, filtered by kind, for both the dots and the summary line. Comps are a
-  // snapshot the worker owns (see docs/comp-workflow.md rule A1) -- this card never
-  // writes to house.comps directly, only sends addComp/removeComp and reads back
-  // whatever the next updateSidePanel broadcast carries.
   const rentComps = useMemo(() => (house.comps ?? []).filter((c) => c.kind === 'rent'), [house.comps]);
   const soldComps = useMemo(() => (house.comps ?? []).filter((c) => c.kind === 'sold'), [house.comps]);
-  // There is no ARV slider to borrow bounds from the way the rent dots borrow the rent
-  // slider's, so the sold dot-strip derives its own from the comps themselves.
   const soldBounds = useMemo(() => {
     if (soldComps.length === 0) return { min: 0, max: 1 };
     const amounts = soldComps.map((c) => c.amount);
     return { min: Math.round(Math.min(...amounts) * 0.9), max: Math.round(Math.max(...amounts) * 1.1) };
   }, [soldComps]);
 
-  const findCompsForHouse = async (kind: 'rent' | 'sold') => {
+  const findCompsForHouse = async (kind: 'rent' | 'sold', searchSource: CompSearchSource = house.source ?? 'redfin') => {
     const response = await chrome.runtime.sendMessage({
-      action: 'startCompSession', targetKey: houseKey(house), kind
+      action: 'startCompSession', targetKey: houseKey(house), kind, searchSource
     });
     if (response && response.ok === false) {
       console.error('Could not start comp session:', response.reason);
@@ -1073,17 +945,11 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
             the generic branch rather than adding a third renderDropdownContent type. */}
         {section.params.includes('arv') && (
           <div className="pt-2 border-t border-gray-200 dark:border-gray-700">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <span className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">
-                Sold comps
+                Sale comps
               </span>
-              <button
-                type="button"
-                className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-                onClick={() => findCompsForHouse('sold')}
-              >
-                Find sold comps
-              </button>
+              <CompSearchLinks kind="sold" subjectSource={house.source ?? 'redfin'} onStart={(source) => findCompsForHouse('sold', source)} />
             </div>
             {soldComps.length > 0 && (
               <CompDots
@@ -1205,17 +1071,11 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
                 slider above -- see CompDots.tsx for why they're a separate track rather than
                 overlaid on the <input> itself. */}
             <div className="mb-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">
                   Rent comps
                 </span>
-                <button
-                  type="button"
-                  className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-                  onClick={() => findCompsForHouse('rent')}
-                >
-                  Find rent comps
-                </button>
+                <CompSearchLinks kind="rent" subjectSource={house.source ?? 'redfin'} onStart={(source) => findCompsForHouse('rent', source)} />
               </div>
               <CompDots
                 comps={rentComps}
@@ -1380,15 +1240,32 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
         highlighted ? 'border-purple-500 ring-2 ring-purple-400' : 'border-gray-200 dark:border-gray-700'
       }`}
     >
-      <div>
+      <button
+        type="button"
+        data-testid="toggle-house-card"
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-2 text-left"
+        onClick={() => {
+          setExpanded((isExpanded) => !isExpanded);
+          setOpenSection(null);
+        }}
+      >
+        <span
+          data-testid="house-status-dot"
+          aria-label={primaryMetricStatus}
+          title={primaryMetricStatus}
+          className={`h-2.5 w-2.5 shrink-0 rounded-full ${primaryToneDotClasses[primaryTone]}`}
+        />
+        <span className="min-w-0 flex-1 break-words text-base font-medium leading-snug text-gray-900 dark:text-white">
+          {house.address || 'Address unavailable'}
+        </span>
+        <DropdownArrow isOpen={expanded} />
+      </button>
+
+      {expanded && (<>
+      <div className="pt-3">
         <div className="space-y-3">
-          {/* Address takes the width it needs; the actions stay pinned beside it rather
-              than stealing width from every row below. */}
-          <div className="flex items-start justify-between gap-2">
-            <h3 className="text-gray-900 dark:text-white font-medium text-base leading-snug break-words text-left min-w-0">
-              {house.address || 'Address unavailable'}
-            </h3>
-            <div className="flex gap-1 shrink-0 -mt-0.5">
+          <div className="flex justify-end gap-1 -mt-1">
               <button
                 type="button"
                 aria-label={`Open listing on ${SITE_NAMES[house.source ?? 'redfin']}`}
@@ -1418,7 +1295,6 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
                 </svg>
               </button>
-            </div>
           </div>
 
           <div className="flex items-baseline gap-2 text-sm">
@@ -1540,6 +1416,7 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
         const section = MODES[mode].sections.find((s) => s.id === openSection);
         return section ? renderSection(section) : null;
       })()}
+      </>)}
     </div>
   )
 }

@@ -44,6 +44,8 @@ interface HomesSiteAdapter {
   matchesHost(h: string): boolean;
   isValidPropertyId(id: unknown): boolean;
   isDetailPage(): boolean;
+  isRentalDetailPage(): boolean;
+  listingStatusFromCard(el: Element): string | null;
   detailInjectionTarget(): InjectionTarget | null;
   extractFromDetailPage(): HouseData | null;
   findCardElements(): Element[];
@@ -51,7 +53,15 @@ interface HomesSiteAdapter {
   cardInjectionTarget(el: Element): InjectionTarget;
   extractFromCard(el: Element): HouseData | null;
   compFacts(el: Element): { amountText: string | null; priceLabel: string | null; soldDateText: string } | null;
-  extraInjectionTargets(): unknown[];
+  extraInjectionTargets(): Array<{
+    container: Element;
+    insertAfter: Element | null;
+    className: string;
+    extract(): HouseData | null;
+    listingStatus(): string;
+    compFacts(): { amountText: string | null; priceLabel: string | null; soldDateText: string } | null;
+    isCompEligible(kind: 'rent' | 'sold'): boolean;
+  }>;
 }
 
 let HomesAdapter: HomesSiteAdapter;
@@ -130,6 +140,7 @@ function detailHtml(opts: {
   amenities?: string;
   comp?: { pk: string; price: string; address: string; facts: string[] };
   ldJson?: string;
+  rentLabel?: string;
 }) {
   const feature = (value: string, labelClass: string, label: string) =>
     `<div class="property-info-feature"><span class="property-info-feature-detail">${value}</span><span class="${labelClass}">${label}</span></div>`;
@@ -144,7 +155,10 @@ function detailHtml(opts: {
         <div class="ldp-grid-container"><div class="profile-column-left">
           <div class="ldp-property-info-container ldp-section-container">
             <div class="property-info-price-and-icons">
-              <span class="property-info-price" id="price">${opts.price}</span>
+              <div class="${opts.rentLabel ? 'property-info-rent-container' : ''}">
+                <span class="property-info-price" id="price">${opts.price}</span>
+                ${opts.rentLabel ? `<span class="property-info-price price-label">${opts.rentLabel}</span>` : ''}
+              </div>
               <span class="status-pill">$15K PRICE DROP</span>
               <div class="property-info-user-actions">
                 <button class="plain-button btn-like favorite-button" aria-label="Add to Favorites"></button>
@@ -347,6 +361,39 @@ describe('HomesAdapter — results-page cards', () => {
     card.removeAttribute('data-pk');
     expect(HomesAdapter.isInjectableCard(card)).toBe(false);
   });
+
+  it('reads a rental card’s current price, address, and rendered monthly unit', () => {
+    document.body.innerHTML = `
+      <article class="search-placard for-rent-mls-placard" data-pk="fl6r0zg27zyf6">
+        <div class="for-rent-mls-content-container">
+          <p class="current-price"><span>$2,300</span><span class="rent-indicator">Per Month</span></p>
+          <ul class="detailed-info-container"><li>3 Beds</li><li>2 Baths</li><li>1,200 Sq Ft</li><li>Apartment for Rent</li></ul>
+          <p class="address">5852 S Prairie Ave Unit 2, Chicago, IL 60637</p>
+          <div class="placard-user-actions-container"><button class="favorite-button"></button></div>
+          <a href="/property/5852-s-prairie-ave-chicago-il-unit-2/fl6r0zg27zyf6/"></a>
+        </div>
+      </article>`;
+    const card = HomesAdapter.findCardElements()[0];
+    expect(HomesAdapter.isInjectableCard(card)).toBe(true);
+    expect(HomesAdapter.listingStatusFromCard!(card)).toBe('rental');
+    expect(HomesAdapter.extractFromCard(card)).toMatchObject({
+      address: '5852 S Prairie Ave Unit 2, Chicago, IL 60637', price: '$2,300 Per Month',
+      beds: '3', baths: '2', sqft: '1200'
+    });
+    expect(HomesAdapter.compFacts(card)!.amountText).toBe('$2,300 Per Month');
+  });
+
+  it('does not mistake “SOLD As-Is” marketing copy for a sold listing', () => {
+    document.body.innerHTML = cardHtml({
+      pk: 'kzkds44knlm8c', price: '$299,900', address: '4158 S Campbell Ave, Chicago, IL 60632',
+      facts: ['2 Beds', '3 Baths']
+    }).replace(
+      '</address>',
+      '</address><p class="property-description">Property needs some work, SOLD As-Is.</p>'
+    );
+    const card = HomesAdapter.findCardElements()[0];
+    expect(HomesAdapter.listingStatusFromCard(card)).toBe('active');
+  });
 });
 
 describe('HomesAdapter — detail page', () => {
@@ -481,6 +528,21 @@ describe('HomesAdapter — detail page', () => {
     expect(target.insertAfter).toBe(document.querySelector('.property-info-user-actions .favorite-button'));
   });
 
+  it('recognizes the rendered per-month unit on rental details', () => {
+    document.body.innerHTML = detailHtml({
+      price: '$2,999', street: '211 N Harbor Dr Unit 2007', beds: '1', baths: '1', sqft: '--',
+      rentLabel: 'Per Month', ldJson: AMUR_LD
+    });
+    expect(HomesAdapter.isRentalDetailPage()).toBe(true);
+  });
+
+  it('does not mistake a normal detail price block for a rental', () => {
+    document.body.innerHTML = detailHtml({
+      price: '$615,000', street: '2200 Amur Dr Unit B35', beds: '4', baths: '2.5', sqft: '2,282', ldJson: AMUR_LD
+    });
+    expect(HomesAdapter.isRentalDetailPage()).toBe(false);
+  });
+
   it('returns null rather than a partial house when the page has no price', () => {
     document.body.innerHTML = '<main id="mainContent"></main>';
     expect(HomesAdapter.extractFromDetailPage()).toBeNull();
@@ -549,5 +611,43 @@ describe('HomesAdapter — sold cards and comp mode', () => {
 
   it('returns null for no card', () => {
     expect(HomesAdapter.compFacts(null as unknown as Element)).toBeNull();
+  });
+});
+
+describe('HomesAdapter — map popup card', () => {
+  it('extracts and classifies the Google Maps info-window card separately from search cards', () => {
+    document.body.innerHTML = `
+      <div class="gm-style-iw"><div id="click-card-container" class="click-card-container">
+        <a href="/property/726-n-troy-st-chicago-il/kbvbfwd3qnh65/" data-pk="kbvbfwd3qnh65">
+          <div class="top-line-container"><button class="favorite-button"></button><p class="property-price">$380,000</p></div>
+          <ul class="property-info-container"><li>3 Beds</li><li>1 Bath</li></ul>
+          <p class="property-address">726 N Troy St</p><p class="property-city-state-zip">Chicago, IL 60612</p>
+        </a>
+      </div></div>`;
+    const extra = HomesAdapter.extraInjectionTargets()[0];
+    expect(extra.container.className).toBe('top-line-container');
+    expect(extra.className).toContain('sidecar-MapPopupCalculator');
+    expect(extra.extract()).toMatchObject({
+      propertyID: 'kbvbfwd3qnh65', address: '726 N Troy St, Chicago, IL 60612', price: '$380,000',
+      beds: '3', baths: '1', sqft: null
+    });
+    expect(extra.listingStatus()).toBe('active');
+    expect(extra.isCompEligible('sold')).toBe(true);
+    expect(extra.isCompEligible('rent')).toBe(false);
+  });
+
+  it('recognizes a monthly map popup as a rent-comp-only target', () => {
+    document.body.innerHTML = `
+      <div class="gm-style-iw"><div class="click-card-container">
+        <a href="/property/5852-s-prairie-ave-chicago-il-unit-2/fl6r0zg27zyf6/" data-pk="fl6r0zg27zyf6">
+          <div class="top-line-container"><button class="favorite-button"></button><p class="property-price">$2,300 Per Month</p></div>
+          <ul class="property-info-container"><li>3 Beds</li><li>2 Baths</li></ul>
+          <p class="property-address">5852 S Prairie Ave Unit 2</p><p class="property-city-state-zip">Chicago, IL 60637</p>
+        </a>
+      </div></div>`;
+    const extra = HomesAdapter.extraInjectionTargets()[0];
+    expect(extra.listingStatus()).toBe('rental');
+    expect(extra.isCompEligible('rent')).toBe(true);
+    expect(extra.isCompEligible('sold')).toBe(false);
   });
 });

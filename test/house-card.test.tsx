@@ -31,6 +31,27 @@ describe('HouseCard', () => {
     expect(screen.queryByTestId('verdict-strip')).not.toBeInTheDocument();
   });
 
+  it('collapses all card detail behind a status-bearing header', () => {
+    render(<HouseCard house={house()} globalParams={globalParams} />);
+
+    const toggle = screen.getByTestId('toggle-house-card');
+    const dot = screen.getByTestId('house-status-dot');
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(dot).toHaveAttribute('aria-label', 'Primary metric is not ready');
+    expect(dot).toHaveClass('bg-gray-300');
+    expect(screen.getByTestId('rent-field')).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByTestId('rent-field')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Remove house')).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+
+    expect(screen.getByTestId('rent-field')).toBeInTheDocument();
+  });
+
   // The regression that made houses silently vanish from the panel.
   it.each([
     ['an unreadable price', { price: 'N/A' }],
@@ -259,10 +280,12 @@ describe('HouseCard comps', () => {
     ...over
   });
 
-  it('shows a "Find rent comps" entry point in the rent section even with no comps yet', () => {
+  it('shows all three rent-comp sources even with no comps yet', () => {
     render(<HouseCard house={house()} globalParams={globalParams} />);
     fireEvent.click(screen.getByTestId('toggle-income'));
-    expect(screen.getByText('Find rent comps')).toBeInTheDocument();
+    expect(screen.getByTestId('find-rent-comps-redfin')).toBeInTheDocument();
+    expect(screen.getByTestId('find-rent-comps-zillow')).toBeInTheDocument();
+    expect(screen.getByTestId('find-rent-comps-homes')).toBeInTheDocument();
     expect(screen.queryByTestId('comp-dots')).not.toBeInTheDocument();
   });
 
@@ -329,7 +352,7 @@ describe('HouseCard comps', () => {
     expect(sent?.compKey).toBe('redfin:555:rent');
   });
 
-  it('shows "Find sold comps" and sold comps under a flip\'s ARV section', () => {
+  it('shows source-selectable sale comps and sale comps under a flip\'s ARV section', () => {
     render(
       <HouseCard
         house={house({
@@ -341,18 +364,20 @@ describe('HouseCard comps', () => {
     );
     fireEvent.click(screen.getByTestId('toggle-resale'));
 
-    expect(screen.getByText('Find sold comps')).toBeInTheDocument();
+    expect(screen.getByTestId('find-sale-comps-redfin')).toBeInTheDocument();
+    expect(screen.getByTestId('find-sale-comps-zillow')).toBeInTheDocument();
+    expect(screen.getByTestId('find-sale-comps-homes')).toBeInTheDocument();
     expect(screen.getByTestId('comp-dot')).toBeInTheDocument();
-    expect(screen.getByTestId('comp-list')).toHaveTextContent('(list)');
+    expect(screen.getByTestId('comp-list')).toHaveTextContent('(last list)');
   });
 
-  it('clicking "Find rent comps" starts a comp session for this house', () => {
+  it('starts a comp session for the selected source and the same subject house', () => {
     render(<HouseCard house={house({ propertyID: '777' })} globalParams={globalParams} />);
     fireEvent.click(screen.getByTestId('toggle-income'));
-    fireEvent.click(screen.getByText('Find rent comps'));
+    fireEvent.click(screen.getByTestId('find-rent-comps-zillow'));
 
     expect(chrome.runtime.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ action: 'startCompSession', targetKey: 'redfin:777', kind: 'rent' })
+      expect.objectContaining({ action: 'startCompSession', targetKey: 'redfin:777', kind: 'rent', searchSource: 'zillow' })
     );
   });
 });

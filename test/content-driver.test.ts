@@ -27,6 +27,7 @@ interface Driver {
   ensureCalculatorOnDetailPage(): void;
   ensureCalculatorOnCard(cardEl: Element): void;
   setCompSession(session: unknown): void;
+  actionForListing(status: string, session: unknown): string;
   reconcileMapPins(): void;
   sweepMapPins(): void;
   setShowHousesOnMap(value: boolean): void;
@@ -74,7 +75,7 @@ function loadDriver(siteStub?: Record<string, unknown>): Driver {
     'HomesAdapter',
     `${parsersSource}\n${withSiteOverride}; return {
       injectInto, createCalculatorElement, ensureCalculatorStyles, ensureCalculatorOnDetailPage,
-      ensureCalculatorOnCard,
+      ensureCalculatorOnCard, actionForListing,
       setCompSession: (s) => { compSession = s; },
       reconcileMapPins, sweepMapPins, mapHouseKey, installMapPinInterceptors,
       setShowHousesOnMap: (v) => { showHousesOnMap = v; },
@@ -205,8 +206,8 @@ describe('button click interception', () => {
 
   /**
    * The old listeners were registered on the button, which is the *end* of the capture
-   * path -- an ancestor's capture handler had already run by then. These are on document,
-   * so nothing between document and the button ever sees the event.
+   * path -- an ancestor's capture handler had already run by then. These are on window,
+   * so nothing later in the capture path ever sees the event.
    */
   it('stops the event before any ancestor handler sees it, in either phase', () => {
     const capture = vi.fn();
@@ -222,6 +223,16 @@ describe('button click interception', () => {
     clickOn(button);
     expect(capture).not.toHaveBeenCalled();
     expect(bubble).not.toHaveBeenCalled();
+  });
+
+  it('runs before Zillow-style window routing registered after document_start', () => {
+    const router = vi.fn();
+    const button = driver.createCalculatorElement(() => ({ ok: true }));
+    renderInsideLink().appendChild(button);
+    window.addEventListener('click', router, { capture: true, once: true });
+
+    clickOn(button);
+    expect(router).not.toHaveBeenCalled();
   });
 
   it('intercepts a click that lands on the icon inside the button, not the button itself', () => {
@@ -328,6 +339,49 @@ describe('button click interception', () => {
   });
 });
 
+describe('listing action policy', () => {
+  const session = (kind: 'rent' | 'sold') => ({ kind });
+
+  it.each([
+    ['active', null, 'analyze'],
+    ['sold', null, 'none'],
+    ['rental', null, 'none'],
+    ['unknown', null, 'none'],
+    ['active', session('rent'), 'none'],
+    ['sold', session('rent'), 'none'],
+    ['rental', session('rent'), 'rent-comp'],
+    ['active', session('sold'), 'sale-comp'],
+    ['sold', session('sold'), 'sale-comp'],
+    ['rental', session('sold'), 'none']
+  ])('%s with %o resolves to %s', (status, compSession, expected) => {
+    expect(driver.actionForListing(status as string, compSession)).toBe(expected);
+  });
+});
+
+describe('card injection after async card hydration', () => {
+  it('reconsiders a card that had no listing link on the first pass', () => {
+    document.body.innerHTML = '<article id="card"></article>';
+    const card = document.getElementById('card')!;
+    const site = {
+      id: 'zillow',
+      isInjectableCard: (el: Element) => Boolean(el.querySelector('a[href*="/homedetails/"]')),
+      extractFromCard: () => ({ propertyID: '1', price: '$2,225/mo', url: '/homedetails/x/1_zpid/' }),
+      compFacts: () => ({ amountText: '$2,225/mo', priceLabel: null, soldDateText: '' }),
+      cardInjectionTarget: (el: Element) => ({ container: el, insertAfter: null }),
+      cardButtonClassName: 'bp-CalculatorExtension'
+    };
+    const d = loadDriver(site);
+    d.setCompSession({ kind: 'rent', targetKey: 'zillow:9', subject: { address: '123 Main St' } });
+
+    d.ensureCalculatorOnCard(card);
+    expect(card.querySelector('.bp-CalculatorExtension')).toBeNull();
+
+    card.innerHTML = '<a href="/homedetails/x/1_zpid/">Rental</a>';
+    d.ensureCalculatorOnCard(card);
+    expect(card.querySelector('.bp-CalculatorExtension')).not.toBeNull();
+  });
+});
+
 describe('detail-page injection', () => {
   const detailSite = (target: () => InjectionTarget | null) => ({
     isDetailPage: () => true,
@@ -399,6 +453,16 @@ describe('detail-page injection', () => {
     const d = loadDriver(detailSite(() => null));
     d.ensureCalculatorOnDetailPage();
     expect(document.querySelectorAll('.bp-CalculatorExtension')).toHaveLength(0);
+  });
+
+  it('withholds Analyze when an adapter identifies a rental detail page', () => {
+    document.body.innerHTML = '<div id="bar"></div>';
+    const d = loadDriver({
+      ...detailSite(() => ({ container: document.getElementById('bar') })),
+      isRentalDetailPage: () => true
+    });
+    d.ensureCalculatorOnDetailPage();
+    expect(document.querySelector('.bp-CalculatorExtension')).toBeNull();
   });
 });
 

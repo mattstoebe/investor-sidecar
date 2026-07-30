@@ -263,20 +263,11 @@ the adapter's suite already has the fixture helpers.
 2. **There is no `buildHomesUrl`.** It needs a design decision first, because Homes.com's search
    grammar cannot express what the other two do.
 
-**Measured grammar.** No zip-scoped paths exist at all: `/78745/`, `/78745/sold/`,
-`/78745/apartments-for-rent/` and every variant tried returned **404**. Searches are city-slug
-scoped — `/austin-tx/sold/`, `/austin-tx/homes-for-rent/`. Beds work as an exact filter
-(`/austin-tx/sold/3-bedroom/` returned 40 cards, all exactly 3 beds). **Baths have no path
-form**: `/austin-tx/sold/3-bedroom-2-bathroom/` redirected to `/austin-tx/sold/2-to-3-bedroom/`,
-silently dropping baths *and* widening beds into a range.
-
-**The decision.** Homes.com comps would therefore be **city-scoped and beds-only**, where Redfin
-and Zillow are zip-scoped with a bath minimum ("same beds, ≥ baths", comp-workflow.md §2). A
-city-wide Austin sold search returned a property in 78744 while the subject was in 78745, so this
-is a real quality difference, not a technicality. Either accept it with the weakening documented
-on the session banner, or have Homes.com opt out of comps until a zip-capable query is found.
-`buildCompUrl`'s signature needs no change either way — the city and state are already in the
-`address` string it receives, so a `citySlug(address)` helper is all the derivation it takes.
+**Resolved 2026-07-30.** Homes.com accepts ZIP-scoped paths when city/state precede the ZIP:
+`/chicago-il/60637/homes-for-rent/?bath=2` and
+`/chicago-il/60637/sold/3-bedroom/?bath=2`. A live sold check showed both filters active and a
+"Recently Sold Homes in 60637 with 3-Bedrooms" heading. Homes comp searches now use that grammar:
+ZIP, exact bedroom path when known, and the `bath` minimum query parameter when known.
 
 ### 8c. UNTESTED — Homes.com has never run as a built extension
 

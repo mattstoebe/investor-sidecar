@@ -46,19 +46,43 @@ function buildZillowUrl(zip, beds, baths, kind) {
   return `https://www.zillow.com/homes/${kindSegment}/${segments.join('/')}/`;
 }
 
+/** Homes.com paths need both city/state and ZIP. The city slug is still required even
+ * though the search is ZIP-scoped (e.g. /chicago-il/60637/sold/). */
+function homesCitySlug(address) {
+  const match = String(address ?? '').match(/,\s*([^,]+),\s*([A-Z]{2})\s+\d{5}(?:-\d{4})?\s*$/i);
+  if (!match) return null;
+  const city = match[1].trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const state = match[2].toLowerCase();
+  return city ? `${city}-${state}` : null;
+}
+
+function buildHomesUrl(address, beds, baths, kind) {
+  const city = homesCitySlug(address);
+  const zip = extractZip(address);
+  if (!city || !zip) return null;
+  const base = kind === 'rent'
+    ? `https://www.homes.com/${city}/${zip}/homes-for-rent`
+    : `https://www.homes.com/${city}/${zip}/sold`;
+  const path = beds ? `${base}/${beds}-bedroom/` : `${base}/`;
+  return baths ? `${path}?bath=${baths}` : path;
+}
+
 /**
  * `{ source, address, beds, baths, kind }` -> a comp-search URL, or null when the
- * address carries no zip (there is nothing sane to build without one). Missing beds or
- * baths drop that filter segment rather than guessing a value.
+ * cannot be mapped to that site's search scope. All three require a ZIP; Homes.com also
+ * needs city/state in its path. Missing beds or baths drop that filter segment rather than
+ * guessing a value.
  */
 export function buildCompUrl({ source, address, beds, baths, kind }) {
   if (kind !== 'rent' && kind !== 'sold') return null;
-  const zip = extractZip(address);
-  if (!zip) return null;
-
   const b = floorPositiveInt(beds);
   const ba = floorPositiveInt(baths);
 
+  if (source === 'homes') return buildHomesUrl(address, b, ba, kind);
+
+  const zip = extractZip(address);
+  if (!zip) return null;
   if (source === 'zillow') return buildZillowUrl(zip, b, ba, kind);
-  return buildRedfinUrl(zip, b, ba, kind);
+  if (source === 'redfin') return buildRedfinUrl(zip, b, ba, kind);
+  return null;
 }

@@ -159,7 +159,7 @@ var SidecarParsers = (function () {
       const afterAbbreviated = s.slice(abbreviated.index + abbreviated[0].length);
       return {
         amount: abbreviated[2].toUpperCase() === 'M' ? base * 1_000_000 : base * 1_000,
-        monthly: /\/\s*mo/i.test(s),
+        monthly: /(?:\/\s*mo|per\s+month)/i.test(s),
         approximate: afterAbbreviated.startsWith('+')
       };
     }
@@ -172,7 +172,7 @@ var SidecarParsers = (function () {
     const afterDigits = s.slice(match.index + match[0].length);
     return {
       amount,
-      monthly: /\/\s*mo/i.test(s),
+      monthly: /(?:\/\s*mo|per\s+month)/i.test(s),
       approximate: afterDigits.startsWith('+')
     };
   }

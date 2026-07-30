@@ -6,7 +6,7 @@ recon results below are verified unless marked otherwise._
 ## The feature in one paragraph
 
 From a house's card in the side panel, the user clicks **Find rent comps** (or **Find sold
-comps**). A new tab opens on the *same site the house was captured from*, already flipped to
+comps**). The user chooses Redfin, Zillow, or Homes.com; a new tab opens on that chosen site, already flipped to
 that site's for-rent (or recently-sold) search, clipped to the subject's zip code and
 same-beds/same-baths. On that page, our injected card buttons change meaning: instead of
 "Analyze", each reads **"Add as comp for 8109 Ferndale Dr"**. Every click appends that
@@ -165,7 +165,8 @@ Tab-scoping matters: ordinary browsing in other tabs must keep the plain Analyze
 `\b(\d{5})(?:-\d{4})?\b` of `house.address` (both adapters store full addresses with zip;
 Zillow's extractor already prefers the title address *because* it carries state+zip), beds
 and baths from the house record, and the session's `kind` picks the pattern from the table
-above. Same site as `house.source` — that is what keeps the adapters reusable and the UX
+above. The source picker defaults to `house.source`, while allowing a different supported site
+when it has better coverage or disclosure data. The adapters remain reusable because capture
 "same website, flipped mode". No zip in the address → ack `{ok:false}` and the panel says
 why. Missing beds/baths → drop that filter segment rather than guessing. **Floor fractional
 baths** (2.5 → `min-baths=2` / `2-_baths`): only integer grammar was verified, baths is a
@@ -302,7 +303,7 @@ devtools); after (3) the loop is whole.
   fine for v1, revisit if users complain about stale comps).
 - **Cross-site comps**: a Zillow-captured house could hunt comps on Redfin (better sold
   data in some markets). The model supports it (`comp.source` is per-comp); v1 keeps the
-  same-site rule for UX simplicity.
+  source choice visible for UX clarity.
 - **Comps in the export**: an obvious follow-on — one comps block per house sheet in
   `export.ts`. Not in v1 scope but the data shape above makes it a pure addition.
 - **Bath filter**: exact beds + min baths is asserted above as the right clip; confirm with

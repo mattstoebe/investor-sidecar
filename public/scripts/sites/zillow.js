@@ -170,7 +170,7 @@ var ZillowAdapter = (function () {
   }
 
   const cardHref = (card) =>
-    card?.querySelector('a[href*="/homedetails/"]')?.getAttribute('href') ?? null;
+    card?.querySelector('a[href*="/homedetails/"], a[href*="/apartments/"]')?.getAttribute('href') ?? null;
 
   /**
    * The "save"/heart control inside an action row, whichever way this template spells it.
@@ -361,7 +361,9 @@ var ZillowAdapter = (function () {
 
     isInjectableCard(card) {
       if (!card) return false;
-      // Zillow mixes ad units into the results list; those have no homedetails link.
+      // Exact-price apartment cards are usable rent comps too. The driver separately
+      // rejects "+" starting prices, "Price on request", and coordinate pseudo-ids.
+      // Ads have neither a homedetails nor an apartments link.
       return Boolean(cardHref(card));
     },
 

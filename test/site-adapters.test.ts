@@ -60,6 +60,7 @@ interface SiteAdapter {
   extraInjectionTargets(): unknown[];
   compFacts?(el: Element): { amountText: string | null; priceLabel: string | null; soldDateText: string } | null;
   isRentalDetailPage?(): boolean;
+  listingStatusFromCard?(el: Element): string | null;
   mapPinContainer?(): Element | null;
   buildMapProjection?(): { container: Element; fit: unknown } | null;
   projectPoint?(projection: unknown, lat: number, lon: number): { x: number; y: number } | null;
@@ -786,6 +787,22 @@ describe('ZillowAdapter - results page cards', () => {
     expect(h.beds).toBe('3');
     expect(h.baths).toBe('2');
     expect(h.sqft).toBe('1400');
+  });
+
+  it('accepts an exact-price apartment card and uses its numeric article id', () => {
+    document.body.innerHTML =
+      '<article id="zpid_2069881355">'
+      + '<a href="https://www.zillow.com/apartments/chicago-il/example/5XjKXK/">x</a>'
+      + '<span data-testid="property-card-price">$2,295/mo</span>'
+      + '<address data-testid="property-card-address-link">2332 W Addison St, Chicago, IL 60618</address>'
+      + '</article>';
+    const card = ZillowAdapter.findCardElements()[0];
+
+    expect(ZillowAdapter.isInjectableCard(card)).toBe(true);
+    const h = ZillowAdapter.extractFromCard(card)!;
+    expect(h.propertyID).toBe('2069881355');
+    expect(h.price).toBe('$2,295/mo');
+    expect(h.url).toContain('/apartments/');
   });
 
   it.each([

@@ -6,7 +6,7 @@
 const LOG_PREFIX = '[Investor Sidecar]';
 const OBSERVER_OPTIONS = { childList: true, subtree: true };
 /** Bump when shipping a change that needs to be confirmed as loaded in the browser. */
-const SIDECAR_BUILD = '2026-07-26.1';
+const SIDECAR_BUILD = '2026-07-29.1';
 
 const ADAPTERS = [RedfinAdapter, ZillowAdapter, HomesAdapter];
 const site = ADAPTERS.find(a => a.matchesHost(window.location.hostname)) ?? null;
@@ -97,6 +97,16 @@ function ensureCalculatorStyles() {
       }
       .bp-CalculatorExtension[data-sidecar-comp="1"]:not([data-state="saved"], [data-state="error"]) svg {
         fill: currentColor;
+      }
+
+      /* Homes.com's map popup groups its native controls at the top right, unlike
+         ordinary results-card actions. Position this map-only calculator in that
+         same cluster instead of leaving it alone above the price. */
+      .click-card-container .sidecar-MapPopupCalculator {
+        position: absolute;
+        top: 12px;
+        right: 112px;
+        z-index: 2;
       }
 
       /* The session banner. A small fixed pill in a page corner, not a full-width bar:
@@ -246,13 +256,10 @@ async function activateButton(button) {
 /**
  * Swallows every interaction that lands on one of our buttons, before the page sees it.
  *
- * These listeners are on `document`, not on the button. That distinction is the whole
- * point: a capture-phase listener on the button itself is at the *end* of the capture
- * path, so every ancestor's capture handler -- including the router Zillow hangs off its
- * results cards -- has already run by the time it fires. Clicking Analyze on Zillow
- * therefore opened the listing as well as capturing it. Redfin only ever behaved because
- * its adapter deliberately targets the action row Redfin has already excluded from card
- * navigation, not because the old wiring worked.
+ * These listeners are on `window`, the first node in the capture path, and content.js is
+ * loaded at document_start. Zillow routes a card from its own window-capture listener;
+ * listening on document was already too late -- Zillow had called history.pushState()
+ * before our preventDefault ran, so the house was saved and then annoyingly opened.
  *
  * pointerup is in the list because Pointer Events fire ahead of their compatibility mouse
  * events, so a router listening for pointerup navigates before a mouseup handler could
@@ -271,7 +278,7 @@ function installButtonInterceptors() {
     return target.closest(BUTTON_SELECTOR);
   };
 
-  document.addEventListener('click', (e) => {
+  window.addEventListener('click', (e) => {
     const button = ourButton(e);
     if (!button) return;
     consumeEvent(e);
@@ -279,18 +286,18 @@ function installButtonInterceptors() {
   }, true);
 
   for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'auxclick', 'dblclick']) {
-    document.addEventListener(type, (e) => {
+    window.addEventListener(type, (e) => {
       if (ourButton(e)) consumeEvent(e);
     }, true);
   }
 
   for (const type of ['touchstart', 'touchend']) {
-    document.addEventListener(type, (e) => {
+    window.addEventListener(type, (e) => {
       if (ourButton(e)) consumeEvent(e);
     }, { capture: true, passive: false });
   }
 
-  document.addEventListener('keydown', (e) => {
+  window.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
     const button = ourButton(e);
     if (!button) return;
@@ -299,9 +306,14 @@ function installButtonInterceptors() {
   }, true);
 }
 
+// Install before either site's application has a chance to register its delegated card
+// router. The handler is inert until a Sidecar button exists, so doing this at
+// document_start has no effect on ordinary page interactions.
+installButtonInterceptors();
+
 /**
  * Builds the button. `clickHandler` returns { ok, reason } so the outcome can be
- * drawn on the button rather than logged. Activation is handled by the document-level
+ * drawn on the button rather than logged. Activation is handled by the window-level
  * interceptors above; the handler is stashed on the element for them to find.
  *
  * `ariaLabel` and `comp` exist for comp mode: a distinct accessible name ("Add as comp
@@ -468,13 +480,18 @@ function buildComp(houseData, facts, session) {
     return { ok: false, reason: "That's not a rental price. This session is collecting rent comps." };
   }
 
+  const capturedStatus = session.kind === 'rent'
+    ? 'rental'
+    : listingStatus({ detail: !facts, houseData, facts });
   const amountLabel = session.kind === 'rent'
     ? 'rent'
-    // Redfin's sold cards say "Last list price" in every non-disclosure state (recon:
-    // zip 78745, TX); label honestly rather than implying a sold price that never rendered.
-    : (site.id === 'redfin'
-      ? (/sold/i.test(facts?.priceLabel || '') ? 'sold' : 'last-list')
-      : 'sold');
+    : capturedStatus === 'active'
+      ? 'list'
+      // Redfin's sold cards say "Last list price" in every non-disclosure state (recon:
+      // zip 78745, TX); label honestly rather than implying a sold price that never rendered.
+      : (site.id === 'redfin'
+        ? (/sold/i.test(facts?.priceLabel || '') ? 'sold' : 'last-list')
+        : 'sold');
 
   const soldDate = session.kind === 'sold'
     ? facts?.soldDateText?.match(/SOLD ([A-Z]{3} \d+, \d{4})/i)?.[1] ?? null
@@ -489,6 +506,9 @@ function buildComp(houseData, facts, session) {
       address: houseData.address,
       amount: parsed.amount,
       amountLabel,
+      ...(session.kind === 'sold'
+        ? { listingStatus: capturedStatus === 'active' ? 'active' : 'sold' }
+        : {}),
       beds: houseData.beds,
       baths: houseData.baths,
       sqft: houseData.sqft,
@@ -517,8 +537,10 @@ function isCompEligibleCard(cardEl, kind) {
   if (!houseData || !propertyIdIsUsable(houseData.propertyID)) return false;
 
   const facts = site.compFacts?.(cardEl);
-  const parsed = facts ? SidecarParsers.parseCompAmount(facts.amountText) : null;
-  if (!parsed) return true; // Unreadable price: let buildComp explain why on click.
+  const parsed = SidecarParsers.parseCompAmount(facts?.amountText ?? houseData.price);
+  // A button that can only fail is misleading. This covers "Price on request" and
+  // non-disclosure "$--" cards; opening a detail page may expose a usable amount later.
+  if (!parsed) return false;
 
   if (kind === 'rent' && parsed.approximate) return false;
   // Kind mismatch, same case buildComp guards: the user flipped the site's own
@@ -543,6 +565,52 @@ function isCompEligibleCard(cardEl, kind) {
  */
 function looksLikeRentalPrice(priceText) {
   return SidecarParsers.parseCompAmount(priceText)?.monthly === true;
+}
+
+/**
+ * The listing state is a domain fact, not a side effect of the current comp session.
+ * Adapters may provide a stronger site-specific verdict; the shared fallback handles
+ * the signals common to all three card implementations.
+ */
+function listingStatus({ cardEl = null, detail = false, houseData = null, facts = null } = {}) {
+  const adapterStatus = detail
+    ? site.listingStatusFromDetail?.()
+    : site.listingStatusFromCard?.(cardEl);
+  if (['active', 'sold', 'rental', 'unknown'].includes(adapterStatus)) return adapterStatus;
+
+  if (detail && site.isRentalDetailPage?.()) return 'rental';
+  const price = facts?.amountText ?? houseData?.price;
+  if (looksLikeRentalPrice(price)) return 'rental';
+
+  const pageUrl = `${window.location.pathname}${window.location.search}`;
+  if (!detail && /(?:recently[_-]sold|include=sold|sold-\d+mo)/i.test(pageUrl)) return 'sold';
+  if (!detail && /(?:for[_-]rent|\/rentals?(?:\/|$)|rent-homes)/i.test(pageUrl)) return 'rental';
+
+  const evidence = [
+    facts?.priceLabel,
+    facts?.soldDateText,
+    cardEl ? SidecarParsers.separatedText(cardEl) : null,
+    detail
+      ? Array.from(document.querySelectorAll(
+          '[data-testid*="status"], [data-rf-test-name*="status"], '
+          + '.ListingStatusBannerSection, .status-pill, [class*="listing-status"]'
+        )).slice(0, 12).map((el) => SidecarParsers.separatedText(el)).join(' ')
+      : null
+  ].filter(Boolean).join(' ');
+  if (/\b(?:sold|last list price)\b/i.test(evidence)) return 'sold';
+
+  return houseData ? 'active' : 'unknown';
+}
+
+/**
+ * The single policy every injection surface follows. A sale-comp hunt starts on sold
+ * results but deliberately accepts active listings too; their amount is labelled as a
+ * list price when captured.
+ */
+function actionForListing(status, session) {
+  if (!session) return status === 'active' ? 'analyze' : 'none';
+  if (session.kind === 'rent') return status === 'rental' ? 'rent-comp' : 'none';
+  return status === 'active' || status === 'sold' ? 'sale-comp' : 'none';
 }
 
 /**
@@ -604,7 +672,7 @@ function ensureCompBanner() {
   const text = document.createElement('span');
   text.dataset.sidecar = '1';
   text.textContent = [
-    `Adding ${kind === 'sold' ? 'sold' : 'rent'} comps for ${compSubjectStreet()}`,
+    `Adding ${kind === 'sold' ? 'sale' : 'rent'} comps for ${compSubjectStreet()}`,
     displayCompPrice(subject?.price),
     factsText || null,
     sqftText
@@ -646,21 +714,23 @@ async function refreshCompSession() {
   } catch {
     response = null;
   }
-  const next = response?.session ?? null;
+  applyCompSession(response?.session ?? null);
+}
+
+/** Apply a session received either from the worker query or its post-navigation handoff.
+ * The direct handoff closes the last timing hole on very fast result pages: content scripts
+ * are ready at document_start, but their UI work must still wait until a body exists. */
+function applyCompSession(next) {
   const changed = JSON.stringify(next) !== JSON.stringify(compSession);
   compSession = next;
   if (changed) {
     sweepInjectedButtons();
-    ensureCompBanner();
-    processPage();
+    if (document.body) {
+      ensureCompBanner();
+      processPage();
+    }
   }
 }
-
-// Cards permanently ruled out (ads, cards with no listing link). That status doesn't
-// change once determined, so this is a pure perf skip -- unlike the old
-// data-calculator-added attribute, which also skipped cards whose button a React
-// re-render had wiped, so those never got one back.
-const nonInjectableCards = new WeakSet();
 
 /**
  * `insertAfter` places us next to a specific sibling; `position: 'prepend'` puts us first
@@ -681,22 +751,17 @@ function injectInto({ container, insertAfter, position }, button) {
 }
 
 function ensureCalculatorOnCard(cardEl) {
-  if (nonInjectableCards.has(cardEl)) return;
-  if (!site.isInjectableCard(cardEl)) {
-    nonInjectableCards.add(cardEl);
-    return;
-  }
+  // Do not cache a rejection. Zillow reuses a card element while replacing its loading
+  // skeleton with the real link and price; permanently remembering the early "no link"
+  // verdict is what made some valid individual rentals never receive a comp button.
+  if (!site.isInjectableCard(cardEl)) return;
 
-  // Not cached in nonInjectableCards: that set is a permanent, cross-session verdict,
-  // but a card unfit as a rent comp may be a fine sold comp (or vice versa), and this
-  // card is only unfit while compSession says so.
+  const houseData = site.extractFromCard(cardEl);
+  const facts = site.compFacts?.(cardEl) ?? null;
+  const status = listingStatus({ cardEl, houseData, facts });
+  const action = actionForListing(status, compSession);
+  if (action === 'none') return;
   if (compSession && !isCompEligibleCard(cardEl, compSession.kind)) return;
-
-  // Outside comp mode, a rental listing's card is not a house to Analyze -- its price
-  // is a monthly rent, not a purchase price. Reachable now that comp mode routes people
-  // to rentals searches at all, including after Done, when this card's button has
-  // already reverted to plain Analyze.
-  if (!compSession && looksLikeRentalPrice(site.extractFromCard(cardEl)?.price)) return;
 
   const target = site.cardInjectionTarget(cardEl);
   if (!target?.container || target.container.querySelector('.bp-CalculatorExtension')) return;
@@ -739,14 +804,9 @@ function ensureCalculatorOnDetailPage() {
   }
   if (existing) return;
 
-  // Outside comp mode, a rental listing's detail page is not a house to Analyze -- see
-  // the note on the same check in ensureCalculatorOnCard. Two checks: the structural one
-  // (verified only for Redfin's rental template) and a universal fallback on the
-  // extracted price text itself, which catches a site whose detail-page price field
-  // happens to still carry "/mo" even without a dedicated selector for it.
-  if (!compSession && (site.isRentalDetailPage?.() || looksLikeRentalPrice(site.extractFromDetailPage()?.price))) {
-    return;
-  }
+  const houseData = site.extractFromDetailPage();
+  const status = listingStatus({ detail: true, houseData });
+  if (actionForListing(status, compSession) === 'none') return;
 
   // Matches the container's own item type. Zillow's action bar is a <ul> whose items are
   // <li>, and a <div> dropped in there doesn't participate in the row layout -- the button
@@ -804,12 +864,14 @@ const processPage = () => {
 
   for (const extra of site.extraInjectionTargets()) {
     if (extra.container.querySelector('.bp-CalculatorExtension')) continue;
-    if (!compSession && looksLikeRentalPrice(extra.extract()?.price)) continue;
+    const houseData = extra.extract();
+    const facts = extra.compFacts?.() ?? null;
+    const status = extra.listingStatus?.() ?? listingStatus({ houseData, facts });
+    if (actionForListing(status, compSession) === 'none') continue;
+    if (compSession && extra.isCompEligible?.(compSession.kind) === false) continue;
     const button = compSession
       ? createCalculatorElement(
-          // No compFacts equivalent for this surface either -- extra.extract's own
-          // price field is what gets parsed.
-          handleCompCapture(extra.extract, null),
+          handleCompCapture(extra.extract, extra.compFacts),
           { className: extra.className || site.cardButtonClassName, ariaLabel: compCardAriaLabel(), comp: true }
         )
       : createCalculatorElement(
@@ -819,6 +881,15 @@ const processPage = () => {
     injectInto(extra, button);
   }
 };
+
+// The normal storage/query path remains the source of truth. This is a targeted second
+// delivery path from the worker after a freshly-created comp tab finishes navigating, so
+// a fast Homes.com result page cannot be stranded outside its just-created session.
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  if (request?.action !== 'setCompSession') return;
+  applyCompSession(request.session ?? null);
+  sendResponse?.({ ok: true });
+});
 
 /**
  * True for nodes we injected ourselves. Every such node carries data-sidecar, so this
@@ -1053,6 +1124,10 @@ function installMapPinInterceptors() {
 
 const init = () => {
   if (!site) return;
+  if (!document.body) {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+    return;
+  }
 
   let debounceTimer = null;
   let idleHandle = null;

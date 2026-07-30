@@ -31,6 +31,7 @@
                 "scripts/sites/homes.js",
                 "scripts/content.js"
             ],
+            "run_at": "document_start",
             "matches": ["https://*.redfin.com/*", "https://*.zillow.com/*", "https://*.homes.com/*"]
         }
     ],

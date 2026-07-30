@@ -38,6 +38,25 @@ describe('buildCompUrl', () => {
     );
   });
 
+  it('builds Homes.com ZIP-scoped rent and sale searches with a bath minimum', () => {
+    expect(buildCompUrl({ ...subject, source: 'homes', kind: 'rent' })).toBe(
+      'https://www.homes.com/austin-tx/78745/homes-for-rent/3-bedroom/?bath=2'
+    );
+    expect(buildCompUrl({ ...subject, source: 'homes', kind: 'sold' })).toBe(
+      'https://www.homes.com/austin-tx/78745/sold/3-bedroom/?bath=2'
+    );
+  });
+
+  it('drops missing Homes.com filters and does not fall back for unknown sources', () => {
+    expect(buildCompUrl({ ...subject, source: 'homes', beds: null, kind: 'sold' })).toBe(
+      'https://www.homes.com/austin-tx/78745/sold/?bath=2'
+    );
+    expect(buildCompUrl({ ...subject, source: 'homes', baths: null, kind: 'rent' })).toBe(
+      'https://www.homes.com/austin-tx/78745/homes-for-rent/3-bedroom/'
+    );
+    expect(buildCompUrl({ ...subject, source: 'mls', kind: 'sold' })).toBeNull();
+  });
+
   it('floors a fractional bath count rather than guessing a segment for it', () => {
     const url = buildCompUrl({ ...subject, baths: '2.5', source: 'redfin', kind: 'sold' });
     expect(url).toContain('min-baths=2');

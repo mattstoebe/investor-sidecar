@@ -137,11 +137,16 @@ var HomesAdapter = (function () {
    * just the one spelling we've seen.
    */
   function cardPriceText(card) {
-    const container = card?.querySelector('.price-container');
+    // Sale and sold cards use .price-container, while live rental cards use
+    // .current-price with a child .rent-indicator ("Per Month"). Keep that unit in
+    // the text: parseCompAmount needs it to distinguish a rent comp from a sale price.
+    const container = card?.querySelector('.price-container, .current-price');
     if (!container) return null;
     const clone = container.cloneNode(true);
     clone.querySelectorAll('span[class*="label"], .last-list-price-label').forEach((el) => el.remove());
-    const text = clone.textContent?.replace(/\s+/g, ' ').trim();
+    // `textContent` glues adjacent inline spans ("$2,300Per Month") when a card
+    // omits source whitespace. The shared text walker preserves that semantic boundary.
+    const text = P.separatedText(clone);
     return text || null;
   }
 
@@ -153,6 +158,56 @@ var HomesAdapter = (function () {
     // it's the fallback rather than the source.
     ?? card?.getAttribute('data-detail-url')
     ?? null;
+
+  /** Homes.com renders map selections in a Google Maps info window, not as a search
+   * placard. Keep this extractor deliberately scoped to that popup: its selectors are
+   * also common enough elsewhere on a detail page to pick up the wrong property. */
+  function mapPopupHouse(popup) {
+    const link = popup?.querySelector('a[data-pk][href*="/property/"]');
+    if (!link) return null;
+    const facts = parseFacts(P.separatedText(popup.querySelector('.property-info-container')));
+    const address = [
+      popup.querySelector('.property-address')?.textContent?.trim(),
+      popup.querySelector('.property-city-state-zip')?.textContent?.trim()
+    ].filter(Boolean).join(', ') || null;
+    return {
+      source: 'homes',
+      address,
+      price: P.separatedText(popup.querySelector('.property-price')) || null,
+      beds: facts.beds,
+      baths: facts.baths,
+      sqft: facts.sqft,
+      propertyID: link.getAttribute('data-pk') || homesPropertyId(P.pathnameOf(link.getAttribute('href'), window.location.origin)),
+      url: P.absoluteUrl(link.getAttribute('href'), window.location.origin),
+      latitude: null,
+      longitude: null,
+      hoa: null
+    };
+  }
+
+  function mapPopupStatus(popup) {
+    const evidence = P.separatedText(popup);
+    if (/\b(?:per\s+month|for rent)\b/i.test(evidence)) return 'rental';
+    if (/\bsold\b/i.test(evidence)) return 'sold';
+    return 'active';
+  }
+
+  function mapPopupCompFacts(popup) {
+    const house = mapPopupHouse(popup);
+    if (!house) return null;
+    return {
+      amountText: house.price,
+      priceLabel: null,
+      soldDateText: P.separatedText(popup.querySelector('.status-pill'))
+    };
+  }
+
+  function mapPopupCompEligible(popup, kind) {
+    const facts = mapPopupCompFacts(popup);
+    const parsed = P.parseCompAmount(facts?.amountText);
+    if (!parsed || (kind === 'rent' && parsed.approximate)) return false;
+    return kind === 'rent' ? parsed.monthly : !parsed.monthly;
+  }
 
   return {
     id: 'homes',
@@ -177,6 +232,34 @@ var HomesAdapter = (function () {
      */
     isDetailPage() {
       return Boolean(homesPropertyId(window.location.pathname));
+    },
+
+    listingStatusFromCard(card) {
+      // A status pill is the only structural sold signal. Do this before the normal
+      // for-sale class: sold results reuse that class in some Homes.com templates.
+      if (card?.querySelector('.status-pill.tag-type-sold')) return 'sold';
+      if (card?.classList.contains('for-rent-mls-placard')
+        || card?.classList.contains('for-rent-apts-mf-placard')
+        || /^per\s+month$/i.test(card?.querySelector('.rent-indicator')?.textContent?.replace(/\s+/g, ' ').trim() ?? '')) {
+        return 'rental';
+      }
+      // Never infer sold status from a whole-card text scan here. An ordinary active
+      // listing at 4158 S Campbell says "SOLD As-Is" in its marketing description;
+      // that describes condition, not transaction status, and previously hid Analyze.
+      if (card?.classList.contains('for-sale-placard')) return 'active';
+      return null;
+    },
+
+    /**
+     * Homes.com puts a rental and a for-sale listing on the same /property/... URL, and
+     * its ld+json price is a bare number in both cases. The rendered unit beside #price
+     * is the authoritative distinction: a live rental detail page has
+     * `.property-info-rent-container .price-label` reading "Per Month". Scope this to
+     * the price block so a lease term lower in the description cannot suppress a sale.
+     */
+    isRentalDetailPage() {
+      const rentUnit = document.querySelector('.property-info-rent-container .price-label');
+      return /^per\s+month$/i.test(rentUnit?.textContent?.replace(/\s+/g, ' ').trim() ?? '');
     },
 
     /**
@@ -269,7 +352,8 @@ var HomesAdapter = (function () {
 
     isInjectableCard(card) {
       if (!card || !cardPk(card)) return false;
-      return Boolean(card.querySelector('address') || card.querySelector('.price-container'));
+      return Boolean(card.querySelector('address, .address')
+        || card.querySelector('.price-container, .current-price'));
     },
 
     cardInjectionTarget(card) {
@@ -283,7 +367,7 @@ var HomesAdapter = (function () {
           insertAfter: favorite?.parentElement === actions ? favorite : null
         };
       }
-      const price = card.querySelector('.price-container');
+      const price = card.querySelector('.price-container, .current-price');
       if (price?.parentElement) return { container: price.parentElement, insertAfter: price };
       return { container: card, insertAfter: null };
     },
@@ -301,7 +385,7 @@ var HomesAdapter = (function () {
       return {
         source: 'homes',
         // Both give the full address including state and ZIP, unlike Zillow's cards.
-        address: card.querySelector('address')?.textContent?.trim()
+        address: card.querySelector('address, .address')?.textContent?.trim()
           ?? card.getAttribute('data-listing-title')
           ?? null,
         price: cardPriceText(card),
@@ -346,7 +430,24 @@ var HomesAdapter = (function () {
     },
 
     extraInjectionTargets() {
-      return [];
+      const extras = [];
+      for (const popup of document.querySelectorAll('.gm-style-iw .click-card-container')) {
+        const container = popup.querySelector('.top-line-container');
+        const link = popup.querySelector('a[data-pk][href*="/property/"]');
+        if (!container || !link) continue;
+        const favorite = container.querySelector('.favorite-button');
+        extras.push({
+          container,
+          insertAfter: favorite?.parentElement === container ? favorite : null,
+          className: 'bp-CalculatorExtension sidecar-Button--icon sidecar-MapPopupCalculator',
+          extract: () => mapPopupHouse(popup),
+          listingStatus: () => mapPopupStatus(popup),
+          compFacts: () => mapPopupCompFacts(popup),
+          isCompEligible: (kind) => mapPopupCompEligible(popup, kind),
+          missingDataReason: "Couldn't read this map listing's details."
+        });
+      }
+      return extras;
     },
 
     // Homes.com's own button classes are semantic but tied to its own layout, so the
