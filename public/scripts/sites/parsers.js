@@ -125,6 +125,58 @@ var SidecarParsers = (function () {
     return null;
   }
 
+  /**
+   * A dollar amount from a comp-search card or detail page: `"$2,100/mo"`, `"$369,500"`,
+   * a bare `"425000"` (Redfin's detail-page stats have no $ sign), or `"$--"` (Zillow's
+   * non-disclosure-state sold price). Returns null for the last of those -- there is no
+   * honest number to report -- and otherwise `{ amount, monthly, approximate }`.
+   *
+   * `approximate` is true for an apartment complex's "from" price ("$1,200+/mo",
+   * "$2,158+Fees may apply"): a "+" immediately after the digits, before any unit
+   * suffix. Those are not one unit's rent and the caller rejects them for rent comps.
+   *
+   * `monthly` deliberately has no trailing word-boundary check. Zillow's card price
+   * glues the next line straight on with no separator -- "$1,843/moFees may apply",
+   * verified live -- so "mo" is immediately followed by a letter, not whitespace or
+   * end-of-string. A `\bmo\b`-style match silently returned false there, which broke
+   * the one thing that reads a genuine (non-"+") Zillow rental card as a rental at all.
+   *
+   * Abbreviated prices ("$1.10M", "$950K", verified live on a sold-search card) are
+   * checked first: the plain-digits branch below stops at the decimal point, so
+   * "$1.10M" would otherwise read as "$1" -- off by six orders of magnitude, and
+   * exactly the kind of confidently-wrong number this module exists to avoid.
+   * parseMoney in src/analysis.ts handles the same shape for the same reason; kept as
+   * a second implementation because this file has no import graph to share one from.
+   */
+  function parseCompAmount(text) {
+    const s = String(text ?? '');
+    if (/\$\s*--/.test(s)) return null;
+
+    const abbreviated = s.match(/\$?\s?([\d.,]+)\s*([MK])\b/i);
+    if (abbreviated) {
+      const base = Number(abbreviated[1].replace(/,/g, ''));
+      if (!Number.isFinite(base) || base <= 0) return null;
+      const afterAbbreviated = s.slice(abbreviated.index + abbreviated[0].length);
+      return {
+        amount: abbreviated[2].toUpperCase() === 'M' ? base * 1_000_000 : base * 1_000,
+        monthly: /\/\s*mo/i.test(s),
+        approximate: afterAbbreviated.startsWith('+')
+      };
+    }
+
+    const match = s.match(/\$?\s?([\d,]+)/);
+    if (!match) return null;
+    const amount = Number(match[1].replace(/,/g, ''));
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+
+    const afterDigits = s.slice(match.index + match[0].length);
+    return {
+      amount,
+      monthly: /\/\s*mo/i.test(s),
+      approximate: afterDigits.startsWith('+')
+    };
+  }
+
   /** First number in a string, commas stripped. Used for stat cells with unit suffixes. */
   function firstNumber(text) {
     const m = String(text ?? '').match(/[\d,]+(?:\.\d+)?/);
@@ -189,6 +241,7 @@ var SidecarParsers = (function () {
     separatedText,
     parseHoa,
     parseMoneyAmount,
+    parseCompAmount,
     firstNumber,
     isRendered,
     firstUsable,

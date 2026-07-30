@@ -17,8 +17,13 @@
  * point; treat its transport as a sketch, not a design.
  */
 import {
-    houseKey, applyLocalParams, stampRevision, pushUndoEntry, undoLast
+    houseKey, applyLocalParams, stampRevision, pushUndoEntry, undoLast,
+    addCompToHouse, removeCompFromHouse
 } from './house-storage.js';
+import { buildCompUrl } from './comp-links.js';
+
+/** A session older than this is discarded on the next lookup rather than trusted. */
+const COMP_SESSION_STALE_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Notifies the side panel that stored houses changed. The panel is frequently closed, and in
@@ -91,9 +96,12 @@ function mutateStoredHouses(mutate, undoable) {
                     key: undoable.key,
                     label: undoable.label,
                     index,
-                    // An edit restores only what the user owns; a delete restores the record.
+                    // An edit restores only what the user owns; a delete restores the record;
+                    // a comp removal restores the whole prior comps list, the same shape an
+                    // edit restores localParams from.
                     localParams: undoable.op === 'edit' ? (prior.localParams ?? null) : null,
-                    house: undoable.op === 'delete' ? prior : null
+                    house: undoable.op === 'delete' ? prior : null,
+                    comps: undoable.op === 'comp' ? (prior.comps ?? null) : null
                 });
             }
         }
@@ -250,6 +258,207 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return true;
     }
 
+    /**
+     * Appends a comp to a house's comp list. Acked like addHouse, so an injected button on
+     * the comp results page must not say "Added" until this actually lands -- and can flash
+     * "Already added" on a repeat click of the same listing rather than a generic failure.
+     */
+    if (request.action === "addComp") {
+        (async () => {
+            const { targetKey, comp } = request;
+            if (!targetKey || !comp || typeof comp !== 'object') {
+                sendResponse({ ok: false, reason: 'Invalid comp.' });
+                return;
+            }
+            try {
+                let outcome = 'missing';
+                await mutateStoredHouses((houses) => {
+                    const result = addCompToHouse(houses, targetKey, comp);
+                    if (!result) { outcome = 'missing'; return null; }
+                    if (result.duplicate) { outcome = 'duplicate'; return null; }
+                    outcome = 'added';
+                    return result.updatedHouses;
+                });
+
+                if (outcome === 'missing') {
+                    sendResponse({ ok: false, reason: 'That house is no longer tracked.' });
+                } else if (outcome === 'duplicate') {
+                    sendResponse({ ok: true, added: false, reason: 'Already added' });
+                } else {
+                    sendResponse({ ok: true, added: true });
+                }
+            } catch (error) {
+                sendResponse({
+                    ok: false,
+                    reason: error instanceof Error ? error.message : 'Chrome storage failed'
+                });
+            }
+        })();
+        return true;
+    }
+
+    /**
+     * Removes one comp. Undoable -- unlike an add, a mistaken removal has no other way back,
+     * where a mistaken add is just a re-click away from "Already added". Fire-and-forget like
+     * removeHouse: the comp list UI reads back its own state from the next updateSidePanel
+     * broadcast rather than this response.
+     */
+    if (request.action === "removeComp") {
+        const { targetKey, compKey } = request;
+        if (targetKey && compKey) {
+            mutateStoredHouses((houses) => {
+                const result = removeCompFromHouse(houses, targetKey, compKey);
+                return result ? result.updatedHouses : null;
+            }, { op: 'comp', key: targetKey, label: 'Removed a comp' }).catch((error) => {
+                console.error('Error removing comp:', error);
+            });
+        }
+    }
+
+    /**
+     * Opens a new tab on the comp-search page for one house and marks it, under a dedicated
+     * `compSession` key, as the tab where clicking a result's button means "add as comp" for
+     * that house rather than "analyze". One session at a time, matching how a person actually
+     * works -- a fresh call replaces whatever was there.
+     */
+    if (request.action === "startCompSession") {
+        (async () => {
+            const { targetKey, kind } = request;
+            if (!targetKey || (kind !== 'rent' && kind !== 'sold')) {
+                sendResponse({ ok: false, reason: 'Invalid comp session request.' });
+                return;
+            }
+            try {
+                const stored = await chrome.storage.local.get('storedHouses');
+                const houses = stored.storedHouses || [];
+                const house = houses.find((h) => houseKey(h) === targetKey);
+                if (!house) {
+                    sendResponse({ ok: false, reason: 'That house is no longer tracked.' });
+                    return;
+                }
+
+                const url = buildCompUrl({
+                    source: house.source || 'redfin',
+                    address: house.address,
+                    beds: house.beds,
+                    baths: house.baths,
+                    kind
+                });
+                if (!url) {
+                    sendResponse({ ok: false, reason: "Couldn't find a zip code in this listing's address." });
+                    return;
+                }
+
+                const tab = await chrome.tabs.create({ url });
+                await chrome.storage.local.set({
+                    compSession: {
+                        // A set, not one id: Redfin opens a listing's detail page in a new
+                        // tab rather than routing in place (Zillow overlays the same tab),
+                        // and without following that, comp mode never survived the one
+                        // click users make most -- opening a listing to see it. Grown by
+                        // the tabs.onCreated listener below.
+                        tabIds: [tab.id],
+                        targetKey,
+                        kind,
+                        // Enough to label the banner and buttons without the content script
+                        // needing to re-derive them from the subject house itself.
+                        subject: {
+                            address: house.address,
+                            price: house.price,
+                            beds: house.beds,
+                            baths: house.baths,
+                            sqft: house.sqft,
+                            latitude: house.latitude ?? null,
+                            longitude: house.longitude ?? null
+                        },
+                        startedAt: Date.now()
+                    }
+                });
+                sendResponse({ ok: true });
+            } catch (error) {
+                sendResponse({
+                    ok: false,
+                    reason: error instanceof Error ? error.message : 'Chrome storage failed'
+                });
+            }
+        })();
+        return true;
+    }
+
+    /** Ends the active session early. The banner's only exit, deliberately -- see
+     *  docs/comp-workflow.md §3 on why a session must not outlive its visible indicator. */
+    if (request.action === "endCompSession") {
+        chrome.storage.local.remove('compSession', () => {
+            sendResponse({ ok: true });
+        });
+        return true;
+    }
+
+    /**
+     * A content script's own way to ask "am I in comp mode". Scoped by the *sender's* tab id
+     * rather than trusting the caller -- a content script has no reliable way to learn its own
+     * tab id otherwise, and every ordinary tab must see no session at all.
+     */
+    if (request.action === "getCompSession") {
+        (async () => {
+            const stored = await chrome.storage.local.get('compSession');
+            const session = stored.compSession || null;
+            const tabId = sender.tab?.id;
+
+            if (session && Date.now() - session.startedAt > COMP_SESSION_STALE_MS) {
+                await chrome.storage.local.remove('compSession');
+                sendResponse({ session: null });
+                return;
+            }
+            if (!session || !tabId || !session.tabIds.includes(tabId)) {
+                sendResponse({ session: null });
+                return;
+            }
+            sendResponse({ session });
+        })();
+        return true;
+    }
+
+});
+
+/**
+ * Follows a session across a click that opens a *new* tab rather than navigating the
+ * existing one -- verified live on Redfin, whose card links open the detail page in a
+ * fresh tab rather than routing in place the way Zillow's overlay does. `openerTabId`
+ * is how Chrome records which tab a new one came from, for both a target="_blank" link
+ * and a window.open() call, so this needs no cooperation from the page.
+ *
+ * Deliberately unbounded rather than capped: a session's whole point is following one
+ * house's comp hunt across however many tabs that takes, and the tab picker is the
+ * natural ceiling on how many anyone would actually open.
+ */
+chrome.tabs.onCreated.addListener((tab) => {
+    if (tab.openerTabId === undefined) return;
+    chrome.storage.local.get('compSession').then(({ compSession }) => {
+        if (!compSession || !compSession.tabIds.includes(tab.openerTabId)) return;
+        if (compSession.tabIds.includes(tab.id)) return;
+        chrome.storage.local.set({
+            compSession: { ...compSession, tabIds: [...compSession.tabIds, tab.id] }
+        });
+    });
+});
+
+/**
+ * Drops a closed tab from the session rather than necessarily ending it -- closing the
+ * original results tab after navigating into a detail page shouldn't kick you out of a
+ * session you're still actively using there. The session itself ends, same as Done,
+ * once every tab that was ever part of it is gone.
+ */
+chrome.tabs.onRemoved.addListener((tabId) => {
+    chrome.storage.local.get('compSession').then(({ compSession }) => {
+        if (!compSession || !compSession.tabIds.includes(tabId)) return;
+        const remaining = compSession.tabIds.filter((id) => id !== tabId);
+        if (remaining.length === 0) {
+            chrome.storage.local.remove('compSession');
+        } else {
+            chrome.storage.local.set({ compSession: { ...compSession, tabIds: remaining } });
+        }
+    });
 });
 
 chrome.runtime.onInstalled.addListener(() => {

@@ -164,6 +164,18 @@ var ZillowAdapter = (function () {
     },
 
     /**
+     * Whether this detail page is a rental listing. Checked against the *rendered*
+     * price text, not extractFromDetailPage's own `price` field: that field prefers a
+     * RealEstateListing ld+json blob's `offers.price` when one exists, and verified
+     * live, Zillow publishes exactly that for a rental listing too -- a clean number
+     * with no "/mo" suffix, which is the one signal a rental's price carries.
+     * Content.js uses this to withhold the ordinary Analyze button outside comp mode.
+     */
+    isRentalDetailPage() {
+      return /\/\s*mo/i.test(document.querySelector('[data-testid="price"]')?.textContent || '');
+    },
+
+    /**
      * A zpid in the *page's own path* is the detail-page signal. A results page links
      * to /homedetails/ but its own URL never contains "<digits>_zpid", so this can't
      * confuse the two.
@@ -334,6 +346,23 @@ var ZillowAdapter = (function () {
 
     extraInjectionTargets() {
       return [];
+    },
+
+    /**
+     * Comp-mode extras for a results-page card. Zillow carries no separate price-label
+     * text the way Redfin does -- a non-disclosure-state sold price just renders the
+     * literal "$--", which parseCompAmount already treats as null -- so priceLabel is
+     * always null here; the caller infers 'sold' whenever an amount actually parses.
+     * soldDateText is the card's own text, best-effort: no Zillow sold-date selector has
+     * been verified live yet (see docs/zillow-recon.md).
+     */
+    compFacts(card) {
+      if (!card) return null;
+      return {
+        amountText: card.querySelector('[data-testid="property-card-price"]')?.textContent?.trim() ?? null,
+        priceLabel: null,
+        soldDateText: P.separatedText(card)
+      };
     },
 
     // Zillow's own class names are hashed and unusable, so our button carries only

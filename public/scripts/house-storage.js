@@ -87,6 +87,65 @@ export function mergeEnrichmentIntoLatest(houses, key, enrichment) {
   return { updatedHouses, updatedHouse };
 }
 
+/** Identifies a comp within one house's list, for dedupe and removal. */
+export function compKey(comp) {
+  return `${comp?.source}:${comp?.propertyID}:${comp?.kind}`;
+}
+
+/**
+ * Appends a comp to the newest copy of a house in storage, deduped on
+ * (source, propertyID, kind) so re-clicking the same listing is a no-op rather than a
+ * second entry.
+ *
+ * Deliberately does not call stampRevision. A comp reaches a mounted card through the
+ * `updateSidePanel` broadcast re-render -- the panel replaces its whole `houses` array,
+ * and `HouseCard` is keyed by `houseKey`, so it re-renders without remounting -- not
+ * through revision adoption. Stamping would make `useHouseParams` treat the write as
+ * foreign and discard whatever the user is mid-typing in another card's debounce window,
+ * which is this feature's core workflow, not an edge case. See docs/comp-workflow.md,
+ * rule A1.
+ *
+ * Returns null when the house is gone. Returns `{ duplicate: true }` (with the houses
+ * array unchanged) rather than null on a repeat click, so the caller can still ack
+ * "Already added" instead of a generic failure.
+ */
+export function addCompToHouse(houses, key, comp) {
+  const index = houses.findIndex((house) => houseKey(house) === key);
+  if (index === -1) return null;
+
+  const current = houses[index];
+  const existing = current.comps || [];
+  if (existing.some((c) => compKey(c) === compKey(comp))) {
+    return { updatedHouses: houses, updatedHouse: current, duplicate: true };
+  }
+
+  const updatedHouse = { ...current, comps: [...existing, comp] };
+  const updatedHouses = [...houses];
+  updatedHouses[index] = updatedHouse;
+  return { updatedHouses, updatedHouse, duplicate: false };
+}
+
+/**
+ * Removes one comp from the newest copy of a house. Also does not call stampRevision --
+ * same reasoning as addCompToHouse above.
+ *
+ * Returns null when the house is gone or the comp is already gone (nothing to remove),
+ * which the caller can tell apart from a genuine removal.
+ */
+export function removeCompFromHouse(houses, key, targetCompKey) {
+  const index = houses.findIndex((house) => houseKey(house) === key);
+  if (index === -1) return null;
+
+  const current = houses[index];
+  const existing = current.comps || [];
+  if (!existing.some((c) => compKey(c) === targetCompKey)) return null;
+
+  const updatedHouse = { ...current, comps: existing.filter((c) => compKey(c) !== targetCompKey) };
+  const updatedHouses = [...houses];
+  updatedHouses[index] = updatedHouse;
+  return { updatedHouses, updatedHouse };
+}
+
 /**
  * Undo.
  *
@@ -155,6 +214,19 @@ export function applyUndoEntry(houses, entry) {
       // that landed after the edit -- the mirror of what mergeEnrichmentIntoLatest avoids.
       localParams: entry.localParams ? { ...entry.localParams } : undefined
     };
+    const updated = [...houses];
+    updated[index] = restored;
+    return { updatedHouses: updated, restored };
+  }
+
+  if (entry.op === 'comp') {
+    // Gone since -- nothing to restore the comp list onto.
+    if (index === -1) return null;
+    // Deliberately no stampRevision, unlike every other branch here: a comp-only write
+    // must never trigger a mounted card's foreign-write adoption (rule A1 in
+    // docs/comp-workflow.md), or restoring a removed comp would eat pending keystrokes
+    // in whatever field the user happens to be mid-edit on.
+    const restored = { ...houses[index], comps: entry.comps ? [...entry.comps] : [] };
     const updated = [...houses];
     updated[index] = restored;
     return { updatedHouses: updated, restored };
