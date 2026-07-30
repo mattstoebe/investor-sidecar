@@ -212,7 +212,9 @@ describe('RedfinAdapter - detail page', () => {
       <div class="MainHouseInfoPanel"></div>
       <div class="bp-homeAddress"><span class="full-address">322 NW 200th St, Shoreline, WA 98177</span></div>
       <div class="home-main-stats-variant">
-        <div data-rf-test-id="abp-price"><span class="statsValue">$975,000</span></div>
+        <div class="stat-block price-section" data-rf-test-id="abp-price">
+          <span class="statsValue">$975,000</span><span>Est. $6,100/mo</span>
+        </div>
         <div data-rf-test-id="abp-beds"><span class="statsValue">4</span></div>
         <div data-rf-test-id="abp-baths">3 ba</div>
         <div data-rf-test-id="abp-sqFt"><span class="statsValue">2,380</span></div>
@@ -233,6 +235,11 @@ describe('RedfinAdapter - detail page', () => {
     expect(window.location.href).not.toContain('/home/');
     expect(RedfinAdapter.isDetailPage()).toBe(true);
     expect(RedfinAdapter.detailInjectionTarget()).not.toBeNull();
+  });
+
+  it('does not treat the current for-sale price block as a rental', () => {
+    expect(document.querySelector('.stat-block.price-section')).not.toBeNull();
+    expect(RedfinAdapter.isRentalDetailPage!()).toBe(false);
   });
 
   // The action row overflows rather than wraps once the side panel narrows the viewport,

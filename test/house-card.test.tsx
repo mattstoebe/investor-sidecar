@@ -45,11 +45,44 @@ describe('HouseCard', () => {
 
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByTestId('rent-field')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('Remove house')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Remove house')).toBeInTheDocument();
+    expect(screen.getByLabelText(/Open listing on/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Show .* on map/i)).toBeInTheDocument();
+    expect(screen.getByLabelText('Expand house details')).toBeInTheDocument();
 
     fireEvent.click(toggle);
 
     expect(screen.getByTestId('rent-field')).toBeInTheDocument();
+  });
+
+  it('uses a highlighted map icon as the per-house visibility toggle', () => {
+    const onShowOnMap = vi.fn();
+    const { rerender } = render(
+      <HouseCard
+        house={house()}
+        globalParams={globalParams}
+        mapVisible={false}
+        onShowOnMap={onShowOnMap}
+      />
+    );
+
+    const hiddenButton = screen.getByLabelText(/Show .* on map/i);
+    expect(hiddenButton).toHaveAttribute('aria-pressed', 'false');
+    expect(hiddenButton).not.toHaveClass('bg-pink-100');
+    fireEvent.click(hiddenButton);
+    expect(onShowOnMap).toHaveBeenCalledOnce();
+
+    rerender(
+      <HouseCard
+        house={house()}
+        globalParams={globalParams}
+        mapVisible
+        onShowOnMap={onShowOnMap}
+      />
+    );
+    const visibleButton = screen.getByLabelText(/Hide .* from map/i);
+    expect(visibleButton).toHaveAttribute('aria-pressed', 'true');
+    expect(visibleButton).toHaveClass('bg-pink-100');
   });
 
   // The regression that made houses silently vanish from the panel.

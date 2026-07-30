@@ -1250,77 +1250,97 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, onSho
         highlighted ? 'border-purple-500 ring-2 ring-purple-400' : 'border-gray-200 dark:border-gray-700'
       }`}
     >
-      <button
-        type="button"
-        data-testid="toggle-house-card"
-        aria-expanded={expanded}
-        className="flex w-full items-center gap-2 text-left"
-        onClick={() => {
-          setExpanded((isExpanded) => !isExpanded);
-          setOpenSection(null);
-        }}
-      >
-        <span
-          data-testid="house-status-dot"
-          aria-label={primaryMetricStatus}
-          title={primaryMetricStatus}
-          className={`h-2.5 w-2.5 shrink-0 rounded-full ${primaryToneDotClasses[primaryTone]}`}
-        />
-        <span className="min-w-0 flex-1 break-words text-base font-medium leading-snug text-gray-900 dark:text-white">
-          {house.address || 'Address unavailable'}
-        </span>
-        <DropdownArrow isOpen={expanded} />
-      </button>
+      <div className="flex w-full items-center gap-1">
+        <button
+          type="button"
+          data-testid="toggle-house-card"
+          aria-expanded={expanded}
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          onClick={() => {
+            setExpanded((isExpanded) => !isExpanded);
+            setOpenSection(null);
+          }}
+        >
+          <span
+            data-testid="house-status-dot"
+            aria-label={primaryMetricStatus}
+            title={primaryMetricStatus}
+            className={`h-2.5 w-2.5 shrink-0 rounded-full ${primaryToneDotClasses[primaryTone]}`}
+          />
+          <span className="min-w-0 flex-1 break-words text-base font-medium leading-snug text-gray-900 dark:text-white">
+            {house.address || 'Address unavailable'}
+          </span>
+        </button>
+        <button
+          type="button"
+          aria-label={mapVisible
+            ? `Hide ${house.address || 'house'} from map`
+            : `Show ${house.address || 'house'} on map`}
+          aria-pressed={mapVisible}
+          title={mapVisible
+            ? 'Hide from map'
+            : house.latitude === null || house.longitude === null
+              ? 'Location unavailable for this saved house'
+              : 'Show on map'}
+          disabled={!mapVisible && (house.latitude === null || house.longitude === null)}
+          className={`rounded p-1.5 transition-colors disabled:cursor-not-allowed disabled:text-gray-300 ${
+            mapVisible
+              ? 'bg-pink-100 text-pink-600 ring-1 ring-pink-300 dark:bg-pink-950 dark:text-pink-300 dark:ring-pink-700'
+              : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:text-gray-500 dark:hover:bg-gray-700 dark:hover:text-gray-300'
+          }`}
+          onClick={() => onShowOnMap?.(house)}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 6.75 3 3v13.5l6 3.75 6-3.75 6 3.75V6.75L15 3 9 6.75Zm0 0v13.5M15 3v13.5" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          aria-label={`Open listing on ${SITE_NAMES[house.source ?? 'redfin']}`}
+          title={`Open on ${SITE_NAMES[house.source ?? 'redfin']}`}
+          className="rounded p-1.5 text-blue-500 hover:bg-blue-50 hover:text-blue-600 dark:hover:bg-blue-950"
+          onClick={() => window.open(house.url, '_blank')}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          aria-label="Remove house"
+          title="Remove house"
+          className="rounded p-1.5 text-red-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950"
+          onClick={() => {
+            chrome.runtime.sendMessage({
+              action: "removeHouse",
+              propertyID: house.propertyID,
+              source: house.source,
+              address: house.address
+            });
+            onRemoved?.(house.address);
+          }}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18 18 6M6 6l12 12" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          aria-label={expanded ? 'Collapse house details' : 'Expand house details'}
+          aria-expanded={expanded}
+          className="rounded p-1 text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
+          onClick={() => {
+            setExpanded((isExpanded) => !isExpanded);
+            setOpenSection(null);
+          }}
+        >
+          <DropdownArrow isOpen={expanded} />
+        </button>
+      </div>
 
       {expanded && (<>
       <div className="pt-3">
         <div className="space-y-3">
-          <div className="flex justify-end gap-1 -mt-1">
-              <button
-                type="button"
-                aria-label={`Show ${house.address || 'house'} on map`}
-                title={mapVisible
-                  ? 'Hide from map'
-                  : house.latitude === null || house.longitude === null
-                    ? 'Location unavailable for this saved house'
-                    : 'Show on map'}
-                disabled={!mapVisible && (house.latitude === null || house.longitude === null)}
-                className="text-pink-500 hover:text-pink-600 disabled:text-gray-300 disabled:cursor-not-allowed px-1 text-xs font-medium"
-                onClick={() => onShowOnMap?.(house)}
-              >
-                {mapVisible ? 'Hide from map' : 'Show on map'}
-              </button>
-              <button
-                type="button"
-                aria-label={`Open listing on ${SITE_NAMES[house.source ?? 'redfin']}`}
-                className="text-blue-500 hover:text-blue-600 p-1"
-                onClick={() => window.open(house.url, '_blank')}
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                aria-label="Remove house"
-                className="text-red-500 hover:text-red-600 p-1"
-                onClick={() => {
-                  chrome.runtime.sendMessage({
-                    action: "removeHouse",
-                    propertyID: house.propertyID,
-                    source: house.source,
-                    // Named in the undo toast, so it says what it will bring back.
-                    address: house.address
-                  });
-                  onRemoved?.(house.address);
-                }}
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-          </div>
-
           <div className="flex items-baseline gap-2 text-sm">
             <span className="font-medium text-gray-700 dark:text-gray-300 tabular-nums">{displayPrice(house.price)}</span>
             <span className="text-gray-500 dark:text-gray-400">

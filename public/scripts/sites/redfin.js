@@ -82,9 +82,8 @@ var RedfinAdapter = (function () {
    * URL indistinguishable by path from a for-sale one. Keyed by `data-rf-test-name`,
    * not `data-rf-test-id`: readStat above finds nothing here, which is why this
    * template's Analyze button (and, before that, its comp button) never appeared at
-   * all -- isDetailPage() didn't recognise the page as a detail page in the first
-   * place. `.stat-block.price-section` doesn't appear anywhere on a rentals search
-   * results page (checked live), so it's also what isDetailPage() below keys off.
+   * all. The `data-rf-test-name="stat-price"` attribute identifies this template;
+   * `.stat-block.price-section` is also used by current for-sale pages.
    */
   function readRentalStat(testName) {
     const el = document.querySelector(`[data-rf-test-name="${testName}"]`);
@@ -92,6 +91,10 @@ var RedfinAdapter = (function () {
     const raw = (el.querySelector('.statsValue')?.textContent ?? el.textContent ?? '').trim();
     if (!raw) return null;
     return P.firstNumber(raw) ?? raw;
+  }
+
+  function isRentalTemplate() {
+    return Boolean(document.querySelector('[data-rf-test-name="stat-price"]'));
   }
 
   return {
@@ -109,7 +112,7 @@ var RedfinAdapter = (function () {
      * calculator as a $4,500 house is exactly the mistake this exists to prevent.
      */
     isRentalDetailPage() {
-      return Boolean(document.querySelector('.stat-block.price-section'));
+      return isRentalTemplate();
     },
 
     /**
@@ -121,7 +124,7 @@ var RedfinAdapter = (function () {
       return Boolean(
         document.querySelector('.MainHouseInfoPanel') ||
         document.querySelector('.home-main-stats-variant') ||
-        document.querySelector('.stat-block.price-section')
+        isRentalTemplate()
       );
     },
 
@@ -161,7 +164,7 @@ var RedfinAdapter = (function () {
       // Rental-listing template: no .home-main-stats-variant, no .bp-homeAddress --
       // <h1> is the reliable address source here, the same fallback Zillow's own
       // extractor already leans on.
-      if (document.querySelector('.stat-block.price-section')) {
+      if (isRentalTemplate()) {
         const address = document.querySelector('h1')?.textContent?.trim() ?? null;
         const price = readRentalStat('stat-price');
         if (!address || !price) return null;
