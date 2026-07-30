@@ -8,7 +8,7 @@ const OBSERVER_OPTIONS = { childList: true, subtree: true };
 /** Bump when shipping a change that needs to be confirmed as loaded in the browser. */
 const SIDECAR_BUILD = '2026-07-26.1';
 
-const ADAPTERS = [RedfinAdapter, ZillowAdapter];
+const ADAPTERS = [RedfinAdapter, ZillowAdapter, HomesAdapter];
 const site = ADAPTERS.find(a => a.matchesHost(window.location.hostname)) ?? null;
 
 function ensureCalculatorStyles() {
@@ -87,6 +87,54 @@ function ensureCalculatorStyles() {
         list-style: none;
       }
 
+      /* Comp mode: same button, a distinct accent so "Add as comp" reads as a different
+         action from Analyze without a wider layout change. Excluded on saved/error --
+         those states have their own semantic colors (green/red) and, at equal
+         selector specificity, whichever rule is declared later in this sheet would
+         otherwise win regardless of which one is more important to see right now. */
+      .bp-CalculatorExtension[data-sidecar-comp="1"]:not([data-state="saved"], [data-state="error"]) {
+        color: #6D28D9;
+      }
+      .bp-CalculatorExtension[data-sidecar-comp="1"]:not([data-state="saved"], [data-state="error"]) svg {
+        fill: currentColor;
+      }
+
+      /* The session banner. A small fixed pill in a page corner, not a full-width bar:
+         an earlier version spanned the top of the viewport and sat on top of Redfin's
+         own sticky filter row, blocking it entirely -- confirmed live. A corner pill is
+         far less likely to collide with a site's own chrome, at the cost of being a
+         little easier to overlook; Done still being the only way to dismiss it (see
+         ensureCompBanner) is what keeps that acceptable. */
+      #sidecar-comp-banner {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 14px;
+        max-width: min(360px, calc(100vw - 24px));
+        border-radius: 8px;
+        background: #1E1B4B;
+        color: #fff;
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1.4;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+      }
+      #sidecar-comp-banner-done {
+        flex: 0 0 auto;
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        background: transparent;
+        color: #fff;
+        border-radius: 4px;
+        padding: 4px 12px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #sidecar-comp-banner-done:hover { background: rgba(255, 255, 255, 0.12); }
+
       .bp-CalculatorExtension__flash {
         position: absolute;
         bottom: calc(100% + 6px);
@@ -159,7 +207,9 @@ async function activateButton(button) {
     if (outcome && outcome.ok === false) {
       setCalculatorState(button, 'error', outcome.reason);
     } else {
-      setCalculatorState(button, 'saved', 'Added to Investor Sidecar');
+      // Comp mode passes its own message ("Added as a comp") -- "Added to Investor
+      // Sidecar" would be wrong there, since nothing new joined the house list.
+      setCalculatorState(button, 'saved', outcome?.message || 'Added to Investor Sidecar');
     }
   } catch (error) {
     setCalculatorState(button, 'error', error?.message || 'Something went wrong');
@@ -228,8 +278,13 @@ function installButtonInterceptors() {
  * Builds the button. `clickHandler` returns { ok, reason } so the outcome can be
  * drawn on the button rather than logged. Activation is handled by the document-level
  * interceptors above; the handler is stashed on the element for them to find.
+ *
+ * `ariaLabel` and `comp` exist for comp mode: a distinct accessible name ("Add as comp
+ * for 8109 Ferndale Dr") and a marker attribute the injected stylesheet colors
+ * differently, so a comp-mode button reads as a different action from Analyze without
+ * touching the injection/dedupe machinery that places it.
  */
-function createCalculatorElement(clickHandler, { className, label } = {}) {
+function createCalculatorElement(clickHandler, { className, label, ariaLabel, comp } = {}) {
   ensureCalculatorStyles();
   installButtonInterceptors();
 
@@ -238,7 +293,8 @@ function createCalculatorElement(clickHandler, { className, label } = {}) {
   wrapper.className = className || 'bp-CalculatorExtension';
   wrapper.setAttribute('role', 'button');
   wrapper.setAttribute('tabindex', '0');
-  wrapper.setAttribute('aria-label', 'Analyze with Investor Sidecar');
+  wrapper.setAttribute('aria-label', ariaLabel || 'Analyze with Investor Sidecar');
+  if (comp) wrapper.dataset.sidecarComp = '1';
   wrapper.innerHTML = CALCULATOR_ICON;
   wrapper._sidecarCapture = clickHandler;
 
@@ -252,11 +308,30 @@ function createCalculatorElement(clickHandler, { className, label } = {}) {
   return wrapper;
 }
 
+/**
+ * Whether a scraped property id is usable as storage identity.
+ *
+ * 'N/A' and null are both rejected: a non-numeric id used to be stored anyway and every
+ * such house collided on one key, silently discarding all but the first.
+ *
+ * The digits-only rule is the default, not the law. Redfin and Zillow ids are bare digits,
+ * but Homes.com keys are alphanumeric ("vff9j5680b68l"), so an adapter may declare its own
+ * validator and only the site that needs it opts in -- widening the rule globally would
+ * quietly drop the protection for the two sites that do satisfy it.
+ *
+ * Deliberately one function called from all three gates (here, buildComp, and
+ * isCompEligibleCard). They were three separate copies of the same regex, which is how the
+ * comp path silently refused every Homes.com card while ordinary Analyze accepted it.
+ */
+function propertyIdIsUsable(propertyID) {
+  return typeof site?.isValidPropertyId === 'function'
+    ? Boolean(site.isValidPropertyId(propertyID))
+    : /^\d+$/.test(String(propertyID ?? ''));
+}
+
 const StorageManager = {
   async saveHouse(houseData) {
-    // 'N/A' and null are both rejected here: a non-numeric id used to be stored anyway
-    // and every such house collided on one key, silently discarding all but the first.
-    if (!/^\d+$/.test(String(houseData?.propertyID ?? ''))) {
+    if (!propertyIdIsUsable(houseData?.propertyID)) {
       return { ok: false, reason: "Couldn't identify this listing. Open the listing page and try there." };
     }
     try {
@@ -282,6 +357,279 @@ const handleCapture = async (extract, missingDataReason) => {
     return { ok: false, reason: error?.message || 'Something went wrong saving this house.' };
   }
 };
+
+/**
+ * Comp mode. See docs/comp-workflow.md §3 for the design this implements.
+ *
+ * Whether *this* tab is in comp mode -- and for which house and kind -- is decided by
+ * the worker, not this script: only the worker can tell one tab from another. `compSession`
+ * mirrors the worker's answer and is refreshed at init and on chrome.storage.onChanged;
+ * every reader below reads this live variable at call time, not a value captured when a
+ * button was created, so a session that starts or ends *after* a button was injected is
+ * still respected -- injected identity (label, color) may lag a beat, but click routing
+ * never does.
+ */
+let compSession = null;
+
+/** The short form of the subject's address, for a button's accessible name and the banner. */
+function compSubjectStreet() {
+  return compSession?.subject?.address?.split(',')[0]?.trim() || 'this house';
+}
+
+function compCardAriaLabel() {
+  return `Add as comp for ${compSubjectStreet()}`;
+}
+
+/** "$425,000" as-is; a bare "425000" (Redfin's detail-page stats carry no $ sign) gets one. */
+function displayCompPrice(price) {
+  const s = String(price ?? '').trim();
+  if (!s) return null;
+  if (s.startsWith('$')) return s;
+  const n = Number(s.replace(/,/g, ''));
+  return Number.isFinite(n) ? `$${n.toLocaleString()}` : s;
+}
+
+/**
+ * Turns extracted listing data -- plus, for a results-page card, its compFacts -- into a
+ * Comp for the active session, or a reason the click can't proceed. The single place the
+ * non-disclosure and "from price" rules live, so card and detail-page capture agree.
+ *
+ * `facts` is null for a detail page (there is no separate compFacts method for one --
+ * extractFromDetailPage's own `price` field already carries whatever the header shows,
+ * which is the true sold price even where the equivalent card only had last-list) and
+ * for the Redfin table-view extra, which has no card element to re-query.
+ */
+function buildComp(houseData, facts, session) {
+  if (!houseData) return { ok: false, reason: "Couldn't read this listing's details." };
+  if (!propertyIdIsUsable(houseData.propertyID)) {
+    // Not "open the listing page and try there" -- that's the ordinary-Analyze advice,
+    // and in comp mode it's actively wrong: navigating in is what a session doesn't
+    // reliably survive (see docs/comp-workflow.md's known limitations).
+    return { ok: false, reason: "Couldn't identify this listing from its card." };
+  }
+  const parsed = SidecarParsers.parseCompAmount(facts ? facts.amountText : houseData.price);
+  if (!parsed) {
+    return {
+      ok: false,
+      reason: session.kind === 'sold'
+        ? 'No sold price shown. Try Redfin, or open the listing.'
+        : "Couldn't read this listing's price."
+    };
+  }
+  // A "from" price (a multi-unit complex's "starting at" listing) is not one unit's
+  // rent -- reject on the "+" marker alone. This used to also block any Redfin URL
+  // containing "/apartment/" outright, which turned out too broad: it rejected
+  // legitimate single-unit apartment listings along with the multi-listing ones, and
+  // "+" is the actual signal (both sites' recorded fixtures agree a "starting at"
+  // price carries it) -- the URL says the building has apartments, not that this
+  // specific price is aggregated.
+  if (session.kind === 'rent' && parsed.approximate) {
+    return { ok: false, reason: 'This looks like a "from" price, not one unit\'s rent.' };
+  }
+
+  // The session's kind has to match what the page is actually showing. Both sites let the
+  // user flip For Sale / Sold / For Rent from the results page itself, and doing so does
+  // not end the session -- so a sold session can end up looking at rental cards. Reported
+  // live. Silently accepting one stores a monthly rent as a sale price (or, worse, a
+  // $369,500 sale price as a monthly rent), which then drives ARV or cash flow.
+  if (session.kind === 'sold' && parsed.monthly) {
+    return { ok: false, reason: "That's a rental price. This session is collecting sold comps." };
+  }
+  // Only enforced when a card's own price text is in hand: a Zillow *detail* page's price
+  // comes from ld+json as a clean number carrying no "/mo" at all (see
+  // ZillowAdapter.isRentalDetailPage), so requiring the suffix there would reject every
+  // legitimate rent comp added from a listing page.
+  if (session.kind === 'rent' && facts && !parsed.monthly) {
+    return { ok: false, reason: "That's not a rental price. This session is collecting rent comps." };
+  }
+
+  const amountLabel = session.kind === 'rent'
+    ? 'rent'
+    // Redfin's sold cards say "Last list price" in every non-disclosure state (recon:
+    // zip 78745, TX); label honestly rather than implying a sold price that never rendered.
+    : (site.id === 'redfin'
+      ? (/sold/i.test(facts?.priceLabel || '') ? 'sold' : 'last-list')
+      : 'sold');
+
+  const soldDate = session.kind === 'sold'
+    ? facts?.soldDateText?.match(/SOLD ([A-Z]{3} \d+, \d{4})/i)?.[1] ?? null
+    : null;
+
+  return {
+    ok: true,
+    comp: {
+      source: site.id,
+      propertyID: houseData.propertyID,
+      kind: session.kind,
+      address: houseData.address,
+      amount: parsed.amount,
+      amountLabel,
+      beds: houseData.beds,
+      baths: houseData.baths,
+      sqft: houseData.sqft,
+      url: houseData.url,
+      soldDate,
+      capturedAt: Date.now()
+    }
+  };
+}
+
+/**
+ * A lighter version of buildComp's early checks, run before injecting a button on a
+ * results-page card so a listing already known to be disqualified -- chiefly an
+ * apartment complex's "from" price -- shows no button at all, rather than a purple one
+ * that can only ever error on click. Real search pages populate a thin zip/beds/baths
+ * filter with these under a "here are some other apartments nearby" fallback section
+ * when the exact filter has few or no results; a working-looking button there that
+ * always fails read as the extension being broken, not the listing being unsuitable.
+ *
+ * Detail pages and the Redfin table-view extra have no card to pre-check here, so they
+ * still rely on buildComp's own gate at click time -- this is strictly a subset of that
+ * gate, applied earlier, not a replacement for it.
+ */
+function isCompEligibleCard(cardEl, kind) {
+  const houseData = site.extractFromCard(cardEl);
+  if (!houseData || !propertyIdIsUsable(houseData.propertyID)) return false;
+
+  const facts = site.compFacts?.(cardEl);
+  const parsed = facts ? SidecarParsers.parseCompAmount(facts.amountText) : null;
+  if (!parsed) return true; // Unreadable price: let buildComp explain why on click.
+
+  if (kind === 'rent' && parsed.approximate) return false;
+  // Kind mismatch, same case buildComp guards: the user flipped the site's own
+  // For Sale / Sold / For Rent toggle without leaving the session. Withholding the
+  // button entirely beats a purple one that can only ever refuse.
+  if (kind === 'sold' && parsed.monthly) return false;
+  if (kind === 'rent' && !parsed.monthly) return false;
+  return true;
+}
+
+/**
+ * Whether a listing's own price reads as a monthly rent ("$4,500/mo") rather than a
+ * purchase price ("$425,000"). The ordinary (non-comp) Analyze flow feeds a house's
+ * price straight into the buy-and-hold/flip/BRRRR purchase-price calculator, so
+ * capturing a rental listing there produces a nonsensical "$4,500 house" -- a mistake
+ * that was unreachable before comp mode existed to send anyone to a rentals search at
+ * all. Both sites' card price text preserves the "/mo" suffix (verified in
+ * docs/comp-workflow.md's recon), so this needs no new selector.
+ *
+ * Comp mode is unaffected by this check: capturing a rental's price is exactly the
+ * point there, and buildComp already validates it on comp mode's own terms.
+ */
+function looksLikeRentalPrice(priceText) {
+  return SidecarParsers.parseCompAmount(priceText)?.monthly === true;
+}
+
+/**
+ * `extract`/`factsFn` mirror handleCapture's `extract`: zero-argument functions run at
+ * click time, not closed over eagerly, so a click always reads the DOM as it is then.
+ */
+function handleCompCapture(extract, factsFn) {
+  return async () => {
+    // Read fresh, not a value captured when this closure was built -- the whole point
+    // of routing through the live variable. See the comment above `compSession`.
+    const session = compSession;
+    if (!session) return { ok: false, reason: 'Comp session ended. Reload the page to try again.' };
+    try {
+      const built = buildComp(extract(), factsFn ? factsFn() : null, session);
+      if (!built.ok) return built;
+
+      const response = await chrome.runtime.sendMessage({
+        action: 'addComp', targetKey: session.targetKey, comp: built.comp
+      });
+      if (!response?.ok) {
+        return { ok: false, reason: response?.reason || 'Extension did not confirm the save.' };
+      }
+      if (response.added === false) {
+        return { ok: false, reason: response.reason || 'Already added' };
+      }
+      return { ok: true, message: 'Added as a comp' };
+    } catch (error) {
+      return { ok: false, reason: error?.message || 'Something went wrong saving this comp.' };
+    }
+  };
+}
+
+/** Builds or updates the always-visible "what am I comping against" strip. The banner is
+ *  the stand-in for a map pin (see docs/comp-workflow.md §5); Done is deliberately the
+ *  only way to dismiss it, because a separate close-X would leave the tab in comp mode
+ *  with no visible indication that every "Analyze"-looking click still adds a comp. */
+function ensureCompBanner() {
+  let banner = document.getElementById('sidecar-comp-banner');
+  if (!compSession) {
+    banner?.remove();
+    return;
+  }
+
+  const { subject, kind } = compSession;
+  const factsText = [subject?.beds && `${subject.beds}bd`, subject?.baths && `${subject.baths}ba`]
+    .filter(Boolean).join('/');
+  const sqftText = subject?.sqft && Number(subject.sqft) > 0
+    ? `${Number(subject.sqft).toLocaleString()} sqft`
+    : null;
+
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'sidecar-comp-banner';
+    banner.dataset.sidecar = '1';
+    document.body.appendChild(banner);
+  }
+  banner.innerHTML = '';
+
+  const text = document.createElement('span');
+  text.dataset.sidecar = '1';
+  text.textContent = [
+    `Adding ${kind === 'sold' ? 'sold' : 'rent'} comps for ${compSubjectStreet()}`,
+    displayCompPrice(subject?.price),
+    factsText || null,
+    sqftText
+  ].filter(Boolean).join(' — ');
+  banner.appendChild(text);
+
+  const done = document.createElement('button');
+  done.type = 'button';
+  done.dataset.sidecar = '1';
+  done.id = 'sidecar-comp-banner-done';
+  done.textContent = 'Done';
+  done.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'endCompSession' }, () => { void chrome.runtime.lastError; });
+  });
+  banner.appendChild(done);
+}
+
+/**
+ * Removes every injected button so the next processPage() pass rebuilds them with the
+ * identity (label, color, click routing) the current session implies. Buttons carry
+ * their handler at creation time, so this is how a session change -- start, Done,
+ * replacement -- reaches buttons injected before it happened. Precedent: processPage's
+ * own stale-card sweep on navigation does the same "remove and let the next pass
+ * reinject" move for the same reason.
+ */
+function sweepInjectedButtons() {
+  document.querySelectorAll('.bp-CalculatorExtension').forEach(removeInjectedButton);
+  lastCleanedUrl = null;
+}
+
+/** Asks the worker whether this tab is in comp mode. Only the worker can answer that --
+ *  it compares sender.tab.id against the session's tracked tabIds (which grows to cover
+ *  a tab opened from one already in it -- see background.js's tabs.onCreated listener),
+ *  and a content script has no other reliable way to learn its own tab id. */
+async function refreshCompSession() {
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({ action: 'getCompSession' });
+  } catch {
+    response = null;
+  }
+  const next = response?.session ?? null;
+  const changed = JSON.stringify(next) !== JSON.stringify(compSession);
+  compSession = next;
+  if (changed) {
+    sweepInjectedButtons();
+    ensureCompBanner();
+    processPage();
+  }
+}
 
 // Cards permanently ruled out (ads, cards with no listing link). That status doesn't
 // change once determined, so this is a pure perf skip -- unlike the old
@@ -314,13 +662,29 @@ function ensureCalculatorOnCard(cardEl) {
     return;
   }
 
+  // Not cached in nonInjectableCards: that set is a permanent, cross-session verdict,
+  // but a card unfit as a rent comp may be a fine sold comp (or vice versa), and this
+  // card is only unfit while compSession says so.
+  if (compSession && !isCompEligibleCard(cardEl, compSession.kind)) return;
+
+  // Outside comp mode, a rental listing's card is not a house to Analyze -- its price
+  // is a monthly rent, not a purchase price. Reachable now that comp mode routes people
+  // to rentals searches at all, including after Done, when this card's button has
+  // already reverted to plain Analyze.
+  if (!compSession && looksLikeRentalPrice(site.extractFromCard(cardEl)?.price)) return;
+
   const target = site.cardInjectionTarget(cardEl);
   if (!target?.container || target.container.querySelector('.bp-CalculatorExtension')) return;
 
-  const button = createCalculatorElement(
-    () => handleCapture(() => site.extractFromCard(cardEl), "Couldn't read this listing's details."),
-    { className: site.cardButtonClassName }
-  );
+  const button = compSession
+    ? createCalculatorElement(
+        handleCompCapture(() => site.extractFromCard(cardEl), () => site.compFacts?.(cardEl)),
+        { className: site.cardButtonClassName, ariaLabel: compCardAriaLabel(), comp: true }
+      )
+    : createCalculatorElement(
+        () => handleCapture(() => site.extractFromCard(cardEl), "Couldn't read this listing's details."),
+        { className: site.cardButtonClassName }
+      );
   injectInto(target, button);
 }
 
@@ -350,6 +714,15 @@ function ensureCalculatorOnDetailPage() {
   }
   if (existing) return;
 
+  // Outside comp mode, a rental listing's detail page is not a house to Analyze -- see
+  // the note on the same check in ensureCalculatorOnCard. Two checks: the structural one
+  // (verified only for Redfin's rental template) and a universal fallback on the
+  // extracted price text itself, which catches a site whose detail-page price field
+  // happens to still carry "/mo" even without a dedicated selector for it.
+  if (!compSession && (site.isRentalDetailPage?.() || looksLikeRentalPrice(site.extractFromDetailPage()?.price))) {
+    return;
+  }
+
   // Matches the container's own item type. Zillow's action bar is a <ul> whose items are
   // <li>, and a <div> dropped in there doesn't participate in the row layout -- the button
   // stacked underneath Save instead of sitting beside it.
@@ -357,10 +730,18 @@ function ensureCalculatorOnDetailPage() {
   const wrapper = document.createElement(isList ? 'li' : 'div');
   wrapper.dataset.sidecar = '1';
   wrapper.className = site.detailWrapperClassName || '';
-  const button = createCalculatorElement(
-    () => handleCapture(() => site.extractFromDetailPage(), "Couldn't read this listing's details."),
-    { className: site.detailButtonClassName, label: 'Analyze' }
-  );
+  const button = compSession
+    ? createCalculatorElement(
+        // No compFacts here: extractFromDetailPage's own `price` already carries
+        // whatever the header shows, which is the true sold price even where the
+        // equivalent card only had last-list (docs/comp-workflow.md §3).
+        handleCompCapture(() => site.extractFromDetailPage(), null),
+        { className: site.detailButtonClassName, label: 'Add as comp', ariaLabel: compCardAriaLabel(), comp: true }
+      )
+    : createCalculatorElement(
+        () => handleCapture(() => site.extractFromDetailPage(), "Couldn't read this listing's details."),
+        { className: site.detailButtonClassName, label: 'Analyze' }
+      );
   wrapper.appendChild(button);
   // The wrapper carries our class, not the button, so injectInto's own dedupe check
   // (which looks for the button class inside the container) still applies to it.
@@ -398,10 +779,18 @@ const processPage = () => {
 
   for (const extra of site.extraInjectionTargets()) {
     if (extra.container.querySelector('.bp-CalculatorExtension')) continue;
-    const button = createCalculatorElement(
-      () => handleCapture(extra.extract, extra.missingDataReason),
-      { className: extra.className || site.cardButtonClassName }
-    );
+    if (!compSession && looksLikeRentalPrice(extra.extract()?.price)) continue;
+    const button = compSession
+      ? createCalculatorElement(
+          // No compFacts equivalent for this surface either -- extra.extract's own
+          // price field is what gets parsed.
+          handleCompCapture(extra.extract, null),
+          { className: extra.className || site.cardButtonClassName, ariaLabel: compCardAriaLabel(), comp: true }
+        )
+      : createCalculatorElement(
+          () => handleCapture(extra.extract, extra.missingDataReason),
+          { className: extra.className || site.cardButtonClassName }
+        );
     injectInto(extra, button);
   }
 };
@@ -502,11 +891,21 @@ const init = () => {
   // it causes, this catches browser back/forward.
   window.addEventListener('popstate', scheduleProcess);
 
+  // Comp mode. Only the worker can tell this tab apart from an ordinary one, so this
+  // tab asks on load and again whenever the session key changes -- a Done click, the
+  // session's tab closing, or a fresh session replacing it, all of which the worker
+  // expresses as one write to the same storage key.
+  refreshCompSession();
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && 'compSession' in changes) refreshCompSession();
+  });
+
   window.__investorSidecarLogView = () => {
     console.group(LOG_PREFIX, 'diagnostics');
     console.log('site adapter:', site.id);
     console.log(site.diagnostics());
     console.log('injected buttons:', document.querySelectorAll('.bp-CalculatorExtension').length);
+    console.log('comp session:', compSession);
     console.groupEnd();
   };
 };

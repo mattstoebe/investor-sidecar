@@ -30,8 +30,3 @@ investor-sidecar-*.zip
 *.njsproj
 *.sln
 *.sw?
-
-# Working notes kept locally rather than in the repo. docs/zillow-recon.md is
-# tracked deliberately -- it records live DOM measurements the adapters depend on.
-docs/architecture.md
-docs/feature-research.md

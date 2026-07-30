@@ -20,6 +20,7 @@ import type { ModeId, SectionDef, ModeOverrides } from './modes';
 import { useHouseParams } from './useHouseParams';
 import { PARAMS, inheritedValue } from './params';
 import type { ParamKey } from './params';
+import CompDots from './CompDots';
 
 interface RentEstimate {
   min: number;
@@ -29,10 +30,36 @@ interface RentEstimate {
   max: number;
 }
 
+/**
+ * A comparable listing the user clipped from a rent/sold search on the site the subject
+ * house was captured from. A snapshot, like the house itself -- never re-scraped.
+ * Written by the worker via `addComp`/`removeComp`; see docs/comp-workflow.md.
+ */
+export interface Comp {
+  source: 'redfin' | 'zillow' | 'homes';
+  propertyID: string;
+  kind: 'rent' | 'sold';
+  address: string;
+  /** Parsed monthly rent (rent comp) or price (sold comp). */
+  amount: number;
+  /**
+   * What the site called the number. Non-disclosure states (TX) never show a sold price;
+   * `last-list` is the honest fallback and must render distinctly from a real sold price.
+   */
+  amountLabel: 'rent' | 'sold' | 'last-list';
+  beds: string;
+  baths: string;
+  sqft: string;
+  url: string;
+  /** From the card sash, sold comps only. */
+  soldDate?: string | null;
+  capturedAt: number;
+}
+
 export interface House {
   /** Which site this was captured from. Absent on records saved before multi-site
    *  support, which were all Redfin -- houseKey() defaults accordingly. */
-  source?: 'redfin' | 'zillow';
+  source?: 'redfin' | 'zillow' | 'homes';
   address: string;
   price: string;
   beds: string;
@@ -65,6 +92,12 @@ export interface House {
   rev?: number;
   lastWriter?: string | null;
   localParams?: StoredLocalParams;
+  /**
+   * Rent/sold comps the user clipped for this house. Written without bumping `rev` --
+   * see docs/comp-workflow.md rule A1 -- so a comp landing never discards keystrokes
+   * mid-debounce in this or any other mounted card.
+   */
+  comps?: Comp[];
 }
 
 /**
@@ -229,8 +262,19 @@ export function cardMetricsFor(params: GlobalParameters, mode: ModeId): MetricKe
 
 /** Mirrors houseKey() in background.js: both sites use bare digits, so the source
  *  must be part of a house's identity or a zpid could collide with a Redfin id. */
+/** Display names for the sites we capture from. Keyed the same way houseKey defaults:
+ *  records saved before multi-site support carry no source and were all Redfin. */
+const SITE_NAMES: Record<'redfin' | 'zillow' | 'homes', string> = {
+  redfin: 'Redfin',
+  zillow: 'Zillow',
+  homes: 'Homes.com'
+};
+
 export const houseKey = (house: Pick<House, 'propertyID'> & { source?: string }) =>
   `${house.source || 'redfin'}:${house.propertyID}`;
+
+/** Mirrors compKey() in house-storage.js -- same duplication, same reason. */
+const compKey = (comp: Comp) => `${comp.source}:${comp.propertyID}:${comp.kind}`;
 
 const formatMoney = (value: number) =>
   value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -690,6 +734,66 @@ function ModePicker({ house, globalParams, overrides, onPick }: {
   );
 }
 
+/**
+ * The list beneath a comp dot track: a summary line ("3 comps · median $2,150", with a
+ * one-click "Use median" -- probably what half of users actually want) and one row per
+ * comp with a link to the listing and a way to remove it. Shared between rent and sold
+ * comps, which differ only in the amount's suffix. See docs/comp-workflow.md §4.
+ */
+function CompSummary({ comps, onPick, onRemove }: {
+  comps: Comp[];
+  onPick: (amount: number) => void;
+  onRemove: (comp: Comp) => void;
+}) {
+  if (comps.length === 0) return null;
+
+  const amounts = [...comps.map((c) => c.amount)].sort((a, b) => a - b);
+  const mid = Math.floor(amounts.length / 2);
+  const median = amounts.length % 2 === 1 ? amounts[mid] : (amounts[mid - 1] + amounts[mid]) / 2;
+  // High to low: the number someone's about to click a dot for is usually the one
+  // they're eyeballing against the top of the list, not buried under the cheapest unit.
+  const sorted = [...comps].sort((a, b) => b.amount - a.amount);
+
+  return (
+    <div className="mt-1 space-y-1.5" data-testid="comp-list">
+      <p className="text-xs text-gray-400 dark:text-gray-500">
+        {comps.length} comp{comps.length === 1 ? '' : 's'} · median ${Math.round(median).toLocaleString()}
+        <button
+          type="button"
+          className="ml-2 text-blue-600 dark:text-blue-400 hover:underline"
+          onClick={() => onPick(Math.round(median))}
+        >
+          Use median
+        </button>
+      </p>
+      {sorted.map((comp) => (
+        <div key={compKey(comp)} className="flex items-center justify-between gap-2 text-xs">
+          <a
+            href={comp.url}
+            target="_blank"
+            rel="noreferrer"
+            className="text-blue-600 dark:text-blue-400 truncate min-w-0 hover:underline"
+          >
+            {comp.address}
+          </a>
+          <span className="text-gray-500 dark:text-gray-400 shrink-0 tabular-nums">
+            ${comp.amount.toLocaleString()}{comp.kind === 'rent' ? '/mo' : ''}
+            {comp.amountLabel === 'last-list' ? ' (list)' : ''}
+          </span>
+          <button
+            type="button"
+            aria-label={`Remove comp ${comp.address}`}
+            className="text-red-500 hover:text-red-600 shrink-0"
+            onClick={() => onRemove(comp)}
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
   house: House,
   globalParams: GlobalParameters,
@@ -864,6 +968,33 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
     return cardMetrics.map((key) => byKey.get(key)!).filter(Boolean);
   }, [cardMetrics, mode]);
 
+  // Split once, filtered by kind, for both the dots and the summary line. Comps are a
+  // snapshot the worker owns (see docs/comp-workflow.md rule A1) -- this card never
+  // writes to house.comps directly, only sends addComp/removeComp and reads back
+  // whatever the next updateSidePanel broadcast carries.
+  const rentComps = useMemo(() => (house.comps ?? []).filter((c) => c.kind === 'rent'), [house.comps]);
+  const soldComps = useMemo(() => (house.comps ?? []).filter((c) => c.kind === 'sold'), [house.comps]);
+  // There is no ARV slider to borrow bounds from the way the rent dots borrow the rent
+  // slider's, so the sold dot-strip derives its own from the comps themselves.
+  const soldBounds = useMemo(() => {
+    if (soldComps.length === 0) return { min: 0, max: 1 };
+    const amounts = soldComps.map((c) => c.amount);
+    return { min: Math.round(Math.min(...amounts) * 0.9), max: Math.round(Math.max(...amounts) * 1.1) };
+  }, [soldComps]);
+
+  const findCompsForHouse = async (kind: 'rent' | 'sold') => {
+    const response = await chrome.runtime.sendMessage({
+      action: 'startCompSession', targetKey: houseKey(house), kind
+    });
+    if (response && response.ok === false) {
+      console.error('Could not start comp session:', response.reason);
+    }
+  };
+
+  const removeComp = (comp: Comp) => {
+    chrome.runtime.sendMessage({ action: 'removeComp', targetKey: houseKey(house), compKey: compKey(comp) });
+  };
+
   const getRentBounds = () => {
     const price = analysis?.params.price ?? localPrice ?? parseMoney(house.price);
     if (!price || price <= 0) return { min: 0, max: 10000 };
@@ -872,7 +1003,10 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
       Number(predictedRent?.max) || 0,
       Number(predictedRent?.iqrhigh) || 0,
       Number(sliderValue) || 0,
-      rental?.breakEvenRent ?? 0
+      rental?.breakEvenRent ?? 0,
+      // Widens exactly like an entered rent already does below -- a comp's number must
+      // always be representable on the track the user clicks it from.
+      ...rentComps.map((c) => c.amount)
     );
 
     const baseMin = Math.round(price * 0.001);
@@ -925,6 +1059,38 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
             onCommit={commit}
           />
         ))}
+        {/* Every mode with an ARV field (flip's resale, BRRRR's refinance) gets sold
+            comps here -- there's no bespoke detail for either section, so this rides
+            the generic branch rather than adding a third renderDropdownContent type. */}
+        {section.params.includes('arv') && (
+          <div className="pt-2 border-t border-gray-200 dark:border-gray-700">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                Sold comps
+              </span>
+              <button
+                type="button"
+                className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                onClick={() => findCompsForHouse('sold')}
+              >
+                Find sold comps
+              </button>
+            </div>
+            {soldComps.length > 0 && (
+              <CompDots
+                comps={soldComps}
+                bounds={soldBounds}
+                onPick={(amount) => { setParam('arv', amount); commit(); }}
+                onRemove={removeComp}
+              />
+            )}
+            <CompSummary
+              comps={soldComps}
+              onPick={(amount) => { setParam('arv', amount); commit(); }}
+              onRemove={removeComp}
+            />
+          </div>
+        )}
       </div>
     );
   };
@@ -1023,6 +1189,35 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
                   const clamped = Math.min(chartBounds.max, Math.max(chartBounds.min, value || chartBounds.min));
                   setParam('monthlyRent', clamped);
                 }}
+              />
+            </div>
+
+            {/* Rent comps: dots on the same [chartBounds.min, chartBounds.max] scale as the
+                slider above -- see CompDots.tsx for why they're a separate track rather than
+                overlaid on the <input> itself. */}
+            <div className="mb-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                  Rent comps
+                </span>
+                <button
+                  type="button"
+                  className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                  onClick={() => findCompsForHouse('rent')}
+                >
+                  Find rent comps
+                </button>
+              </div>
+              <CompDots
+                comps={rentComps}
+                bounds={chartBounds}
+                onPick={(amount) => { setParam('monthlyRent', amount); commit(); }}
+                onRemove={removeComp}
+              />
+              <CompSummary
+                comps={rentComps}
+                onPick={(amount) => { setParam('monthlyRent', amount); commit(); }}
+                onRemove={removeComp}
               />
             </div>
 
@@ -1184,7 +1379,7 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
             <div className="flex gap-1 shrink-0 -mt-0.5">
               <button
                 type="button"
-                aria-label={`Open listing on ${house.source === 'zillow' ? 'Zillow' : 'Redfin'}`}
+                aria-label={`Open listing on ${SITE_NAMES[house.source ?? 'redfin']}`}
                 className="text-blue-500 hover:text-blue-600 p-1"
                 onClick={() => window.open(house.url, '_blank')}
               >
@@ -1322,14 +1517,12 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
       {/* No summary footer: it repeated Cash Flow and Cash-on-Cash, which the verdict
           strip above already shows on every card. */}
       {/*
-        Looked up, not asserted. Section ids are per-mode -- rental has rent and expenses, flip
-        has rehab and resale -- and `openSection` outlives a mode switch, so after switching
-        with a non-shared section open this find returns undefined. It used to carry a `!`,
-        and dereferencing that undefined threw during render, which unmounts the entire panel
-        rather than one card: a blank side panel from switching strategy mid-edit.
-
-        Deliberately not cleared when it goes stale. Nothing renders open and every chevron
-        reads closed, and switching back restores the section the user had open.
+        A section left open across a mode switch may no longer exist in the new mode
+        (Flip has no 'rent' section) -- `find` then returns undefined, and rendering
+        that unconditionally used to crash the whole panel with no error boundary to
+        catch it. Falling back to null here, rather than to some other section, is
+        deliberate: a mode switch closing whatever was open is the same "start clean"
+        behaviour ModePicker already gives the rest of the card.
       */}
       {openSection && (() => {
         const section = MODES[mode].sections.find((s) => s.id === openSection);

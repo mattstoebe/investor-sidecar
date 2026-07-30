@@ -60,11 +60,40 @@ var RedfinAdapter = (function () {
     return P.firstNumber(raw) ?? raw;
   }
 
+  /**
+   * A rental-listing detail page's own stat blocks -- a third detail template,
+   * verified live 2026-07-29 on an active "For Rent" listing at a plain /home/<id>
+   * URL indistinguishable by path from a for-sale one. Keyed by `data-rf-test-name`,
+   * not `data-rf-test-id`: readStat above finds nothing here, which is why this
+   * template's Analyze button (and, before that, its comp button) never appeared at
+   * all -- isDetailPage() didn't recognise the page as a detail page in the first
+   * place. `.stat-block.price-section` doesn't appear anywhere on a rentals search
+   * results page (checked live), so it's also what isDetailPage() below keys off.
+   */
+  function readRentalStat(testName) {
+    const el = document.querySelector(`[data-rf-test-name="${testName}"]`);
+    if (!el) return null;
+    const raw = (el.querySelector('.statsValue')?.textContent ?? el.textContent ?? '').trim();
+    if (!raw) return null;
+    return P.firstNumber(raw) ?? raw;
+  }
+
   return {
     id: 'redfin',
 
     matchesHost(hostname) {
       return /(^|\.)redfin\.com$/i.test(hostname);
+    },
+
+    /**
+     * Whether the current detail page is the rental-listing template (see
+     * extractFromDetailPage below) rather than a for-sale one. Content.js uses this to
+     * withhold the ordinary Analyze button outside comp mode -- a rental's price is a
+     * monthly rent, not a purchase price, and feeding "$4,500/mo" into the buy-and-hold
+     * calculator as a $4,500 house is exactly the mistake this exists to prevent.
+     */
+    isRentalDetailPage() {
+      return Boolean(document.querySelector('.stat-block.price-section'));
     },
 
     /**
@@ -75,7 +104,8 @@ var RedfinAdapter = (function () {
     isDetailPage() {
       return Boolean(
         document.querySelector('.MainHouseInfoPanel') ||
-        document.querySelector('.home-main-stats-variant')
+        document.querySelector('.home-main-stats-variant') ||
+        document.querySelector('.stat-block.price-section')
       );
     },
 
@@ -112,6 +142,31 @@ var RedfinAdapter = (function () {
     },
 
     extractFromDetailPage() {
+      // Rental-listing template: no .home-main-stats-variant, no .bp-homeAddress --
+      // <h1> is the reliable address source here, the same fallback Zillow's own
+      // extractor already leans on.
+      if (document.querySelector('.stat-block.price-section')) {
+        const address = document.querySelector('h1')?.textContent?.trim() ?? null;
+        const price = readRentalStat('stat-price');
+        if (!address || !price) return null;
+
+        const geo = geoFromLdJson(document, P.redfinPropertyId(window.location.pathname));
+        return {
+          source: 'redfin',
+          address,
+          price,
+          beds: readRentalStat('stat-beds'),
+          baths: readRentalStat('stat-baths'),
+          sqft: readRentalStat('stat-sqft'),
+          propertyID: P.redfinPropertyId(window.location.pathname),
+          url: geo?.url ?? window.location.href,
+          latitude: geo?.latitude ?? null,
+          longitude: geo?.longitude ?? null,
+          // Rentals don't carry an HOA line the way for-sale listings do.
+          hoa: null
+        };
+      }
+
       const statsContainer = document.querySelector('.home-main-stats-variant');
       if (!statsContainer) return null;
 
@@ -229,6 +284,22 @@ var RedfinAdapter = (function () {
     },
 
     /**
+     * Comp-mode extras for a results-page card: the raw price text (parsed by
+     * SidecarParsers.parseCompAmount), the label above it -- "Last list price" on a sold
+     * card, since Redfin never shows a true sold price in a non-disclosure state -- and
+     * the card's own text, which carries the sold-date sash ("SOLD MAY 28, 2026") for
+     * the caller to pull a date out of. See docs/comp-workflow.md §3.
+     */
+    compFacts(contentEl) {
+      if (!contentEl) return null;
+      return {
+        amountText: contentEl.querySelector('.bp-Homecard__Price--value')?.textContent?.trim() ?? null,
+        priceLabel: contentEl.querySelector('.bp-Homecard__Price--label')?.textContent?.trim() ?? null,
+        soldDateText: P.separatedText(contentEl)
+      };
+    },
+
+    /**
      * Redfin's table view has a single action bar for the selected row rather than
      * per-card buttons. Returned as an "extra" target the driver injects into.
      */
@@ -275,6 +346,7 @@ var RedfinAdapter = (function () {
         cards: document.querySelectorAll('div.bp-Homecard__Content').length,
         detailPage: this.isDetailPage(),
         detailTarget: !!this.detailInjectionTarget(),
+        rentalDetailTemplate: !!document.querySelector('.stat-block.price-section'),
         tableBar: !!document.querySelector('.ActionBar__homeActionButtons.flex')
       };
     }

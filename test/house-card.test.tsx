@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { HouseCard, DEFAULT_GLOBAL_PARAMETERS } from '../src/App';
-import type { House, GlobalParameters } from '../src/App';
+import type { House, GlobalParameters, Comp } from '../src/App';
 import type { MetricKey } from '../src/metrics';
 
 const globalParams: GlobalParameters = { ...DEFAULT_GLOBAL_PARAMETERS, propertyTaxRate: 1 };
@@ -221,5 +221,138 @@ describe('HouseCard', () => {
 
     // A 50% vacancy override should visibly drag cash flow down relative to the global default.
     expect(overriddenCashFlow).not.toBe(defaultCashFlow);
+  });
+
+  /**
+   * Regression: switching a house's mode while a section only the old mode has (Rent,
+   * absent from Flip) is open used to crash the whole card. `openSection` survives the
+   * mode switch as component state; `MODES['flip'].sections.find(s => s.id === 'rent')`
+   * then returns undefined, and the render used to call renderSection on it unguarded.
+   */
+  it('does not crash when the mode changes away from a section that is open', () => {
+    const { rerender } = render(<HouseCard house={house()} globalParams={globalParams} />);
+    fireEvent.click(screen.getByTestId('toggle-income'));
+    expect(screen.getByTestId('rent-field')).toBeInTheDocument();
+
+    rerender(
+      <HouseCard
+        house={house({ localParams: { mode: 'flip', arv: 520000 } })}
+        globalParams={globalParams}
+      />
+    );
+
+    expect(screen.getByTestId('house-card')).toBeInTheDocument();
+    expect(screen.queryByTestId('rent-field')).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Comps in the card. These exercise the panel half of docs/comp-workflow.md: dots and a
+ * list render from house.comps (never written by this card, only by the worker), and
+ * picking a comp goes through setParam + commit -- the same path a keystroke takes.
+ */
+describe('HouseCard comps', () => {
+  const rentComp = (over: Partial<Comp> = {}): Comp => ({
+    source: 'redfin', propertyID: '555', kind: 'rent', address: '456 Comp Ave, Austin, TX 78745',
+    amount: 2100, amountLabel: 'rent', beds: '3', baths: '2', sqft: '1400',
+    url: 'https://www.redfin.com/x/455/home/555', soldDate: null, capturedAt: 1_000,
+    ...over
+  });
+
+  it('shows a "Find rent comps" entry point in the rent section even with no comps yet', () => {
+    render(<HouseCard house={house()} globalParams={globalParams} />);
+    fireEvent.click(screen.getByTestId('toggle-income'));
+    expect(screen.getByText('Find rent comps')).toBeInTheDocument();
+    expect(screen.queryByTestId('comp-dots')).not.toBeInTheDocument();
+  });
+
+  it('renders a dot and a list row for each rent comp once the section is open', () => {
+    render(
+      <HouseCard
+        house={house({ comps: [rentComp({ propertyID: '1' }), rentComp({ propertyID: '2', amount: 2400 })] })}
+        globalParams={globalParams}
+      />
+    );
+    fireEvent.click(screen.getByTestId('toggle-income'));
+
+    expect(screen.getAllByTestId('comp-dot')).toHaveLength(2);
+    expect(screen.getByTestId('comp-list')).toHaveTextContent('2 comps');
+    expect(screen.getByTestId('comp-list')).toHaveTextContent('456 Comp Ave, Austin, TX 78745');
+  });
+
+  it('clicking a comp dot sets rent to that comp\'s amount', () => {
+    render(
+      <HouseCard
+        house={house({
+          localParams: { sliderValue: 0, percentDown: null, interestRate: null, price: null, additionalCashInvestment: 0, propertyTaxRate: null, vacancyRate: null, maintenanceRate: null, capExRate: null, managementRate: null, insuranceRate: null },
+          comps: [rentComp({ amount: 2750 })]
+        })}
+        globalParams={globalParams}
+      />
+    );
+    fireEvent.click(screen.getByTestId('toggle-income'));
+    fireEvent.click(screen.getByTestId('comp-dot'));
+
+    expect(screen.getByTestId('rent-field')).toHaveValue('$2,750');
+  });
+
+  it('"Use median" adopts the median of the comps shown', () => {
+    render(
+      <HouseCard
+        house={house({
+          localParams: { sliderValue: 0, percentDown: null, interestRate: null, price: null, additionalCashInvestment: 0, propertyTaxRate: null, vacancyRate: null, maintenanceRate: null, capExRate: null, managementRate: null, insuranceRate: null },
+          comps: [rentComp({ propertyID: '1', amount: 2000 }), rentComp({ propertyID: '2', amount: 3000 }), rentComp({ propertyID: '3', amount: 2500 })]
+        })}
+        globalParams={globalParams}
+      />
+    );
+    fireEvent.click(screen.getByTestId('toggle-income'));
+    fireEvent.click(screen.getByText('Use median'));
+
+    expect(screen.getByTestId('rent-field')).toHaveValue('$2,500');
+  });
+
+  it('removing a comp sends removeComp with the target house and comp identity', () => {
+    render(
+      <HouseCard
+        house={house({ propertyID: '999', comps: [rentComp()] })}
+        globalParams={globalParams}
+      />
+    );
+    fireEvent.click(screen.getByTestId('toggle-income'));
+    fireEvent.click(screen.getByLabelText(/Remove comp/));
+
+    const sent = vi.mocked(chrome.runtime.sendMessage).mock.calls
+      .map(([msg]) => msg as { action?: string; targetKey?: string; compKey?: string })
+      .find((msg) => msg?.action === 'removeComp');
+    expect(sent?.targetKey).toBe('redfin:999');
+    expect(sent?.compKey).toBe('redfin:555:rent');
+  });
+
+  it('shows "Find sold comps" and sold comps under a flip\'s ARV section', () => {
+    render(
+      <HouseCard
+        house={house({
+          localParams: { sliderValue: 0, mode: 'flip', arv: 520000 },
+          comps: [rentComp({ kind: 'sold', amount: 495000, amountLabel: 'last-list' })]
+        })}
+        globalParams={globalParams}
+      />
+    );
+    fireEvent.click(screen.getByTestId('toggle-resale'));
+
+    expect(screen.getByText('Find sold comps')).toBeInTheDocument();
+    expect(screen.getByTestId('comp-dot')).toBeInTheDocument();
+    expect(screen.getByTestId('comp-list')).toHaveTextContent('(list)');
+  });
+
+  it('clicking "Find rent comps" starts a comp session for this house', () => {
+    render(<HouseCard house={house({ propertyID: '777' })} globalParams={globalParams} />);
+    fireEvent.click(screen.getByTestId('toggle-income'));
+    fireEvent.click(screen.getByText('Find rent comps'));
+
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'startCompSession', targetKey: 'redfin:777', kind: 'rent' })
+    );
   });
 });

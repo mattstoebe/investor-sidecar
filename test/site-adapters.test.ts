@@ -58,6 +58,8 @@ interface SiteAdapter {
   cardInjectionTarget(el: Element): InjectionTarget;
   extractFromCard(el: Element): HouseData | null;
   extraInjectionTargets(): unknown[];
+  compFacts?(el: Element): { amountText: string | null; priceLabel: string | null; soldDateText: string } | null;
+  isRentalDetailPage?(): boolean;
 }
 
 let RedfinAdapter: SiteAdapter;
@@ -150,6 +152,40 @@ describe('RedfinAdapter - results page cards', () => {
     const { container, insertAfter } = RedfinAdapter.cardInjectionTarget(card);
     expect(container).not.toBeNull();
     expect((insertAfter as Element).className).toContain('bp-FavoriteExtension');
+  });
+});
+
+describe('RedfinAdapter - compFacts (comp search cards)', () => {
+  beforeEach(() => {
+    // Sold card as measured live, zip 78745, TX (non-disclosure state): the big price
+    // is the last-list price, and the sold sash carries the date.
+    setLocation('https://www.redfin.com/zipcode/78745/filter/include=sold-6mo');
+    document.body.innerHTML = `
+      <div class="bp-Homecard">
+        <div class="bp-Homecard__Content">
+          <a href="/TX/Austin/456-Comp-Ave-78745/home/555">link</a>
+          <div class="bp-Homecard__Address">456 Comp Ave, Austin, TX 78745</div>
+          <div class="bp-Homecard__Price">
+            <span class="bp-Homecard__Price--value">$369,500</span>
+            <span class="bp-Homecard__Price--label">Last list price</span>
+          </div>
+          <div class="bp-Homecard__Stats">3 beds2 baths1,400 sq ft</div>
+          <span class="sash">SOLD MAY 28, 2026</span>
+        </div>
+      </div>
+    `;
+  });
+
+  it('reads the price, its label and the sold-sash text', () => {
+    const card = RedfinAdapter.findCardElements()[0];
+    const facts = RedfinAdapter.compFacts!(card)!;
+    expect(facts.amountText).toBe('$369,500');
+    expect(facts.priceLabel).toBe('Last list price');
+    expect(facts.soldDateText).toContain('SOLD MAY 28, 2026');
+  });
+
+  it('returns null without a card element', () => {
+    expect(RedfinAdapter.compFacts!(null as unknown as Element)).toBeNull();
   });
 });
 
@@ -258,6 +294,93 @@ describe('RedfinAdapter - Coming Soon listing (no action bar)', () => {
     expect(h.baths).toBe('1');
     expect(h.sqft).toBe('1074');
     expect(h.hoa).toBe(550);
+  });
+});
+
+describe('RedfinAdapter - rental listing detail page (third template)', () => {
+  /**
+   * Verified live 2026-07-29 on an active "For Rent" listing at a plain /home/<id>
+   * URL -- indistinguishable by path from a for-sale listing. Neither
+   * .MainHouseInfoPanel nor .home-main-stats-variant exist here, so isDetailPage()
+   * used to return false and NO button -- comp or plain Analyze -- ever appeared.
+   * Stats use data-rf-test-name, not data-rf-test-id; there's no .bp-homeAddress.
+   */
+  beforeEach(() => {
+    setLocation('https://www.redfin.com/WA/Seattle/3851-38th-Ave-S-98118/home/171400');
+    document.body.innerHTML = `
+      <h1>3851 38th Ave S, Seattle, WA 98118</h1>
+      <div class="bp-address-banner banner-content desktop">
+        <div class="property-info">For rent$4,500/moPrice3bd&bull;3ba&bull;2,130sq ft3851 38th Ave S, Seattle, WA 98118</div>
+      </div>
+      <div class="stat-block price-section" data-rf-test-name="stat-price">
+        <div class="statsValue price"><span>$4,500/mo</span></div><span class="statsLabel">Price</span>
+      </div>
+      <div class="stat-block beds-section" data-rf-test-name="stat-beds">
+        <div class="statsValue">3</div><span class="statsLabel">bd</span>
+      </div>
+      <div class="stat-block baths-section" data-rf-test-name="stat-baths">
+        <div class="statsValue">3</div><span class="statsLabel">ba</span>
+      </div>
+      <div class="stat-block sqft-section" data-rf-test-name="stat-sqft">
+        <span class="statsValue">2,130</span><div class="statsLabel">sq ft</div>
+      </div>
+      <div class="pill-container-variant">
+        <div class="FavoriteButtonCopFlyoutWrapper RentalControlButtonWrapper">
+          <div class="bp-favoriteButtonWrapper" data-rf-test-id="abp-favoriteButton"></div>
+        </div>
+      </div>
+      <script type="application/ld+json">
+        {"@type":"Product","url":"https://www.redfin.com/WA/Seattle/3851-38th-Ave-S-98118/home/171400","geo":{"latitude":47.5682814,"longitude":-122.2853587}}
+      </script>
+    `;
+  });
+
+  it('is recognised as a detail page even with none of the for-sale template\'s markers', () => {
+    expect(document.querySelector('.MainHouseInfoPanel')).toBeNull();
+    expect(document.querySelector('.home-main-stats-variant')).toBeNull();
+    expect(RedfinAdapter.isDetailPage()).toBe(true);
+  });
+
+  it('does not misfire on a rentals search results page', () => {
+    document.body.innerHTML = '<div class="bp-Homecard__Content"></div>';
+    expect(RedfinAdapter.isDetailPage()).toBe(false);
+  });
+
+  // content.js withholds the ordinary Analyze button on this template outside comp
+  // mode: a rental's price is a monthly rent, not a purchase price to run through the
+  // buy-and-hold calculator.
+  it('identifies itself as a rental listing', () => {
+    expect(RedfinAdapter.isRentalDetailPage!()).toBe(true);
+  });
+
+  it('does not misidentify a for-sale detail page as a rental', () => {
+    document.body.innerHTML = '<div class="home-main-stats-variant"></div>';
+    expect(RedfinAdapter.isRentalDetailPage!()).toBe(false);
+  });
+
+  it('resolves an injection target via the existing pill-container fallback', () => {
+    const target = RedfinAdapter.detailInjectionTarget()!;
+    expect(target).not.toBeNull();
+    expect(target.container!.className).toBe('pill-container-variant');
+  });
+
+  it('extracts price, beds, baths and sqft from the data-rf-test-name stat blocks', () => {
+    const h = RedfinAdapter.extractFromDetailPage()!;
+    expect(h.source).toBe('redfin');
+    expect(h.address).toBe('3851 38th Ave S, Seattle, WA 98118');
+    expect(h.price).toBe('4500');
+    expect(h.beds).toBe('3');
+    expect(h.baths).toBe('3');
+    expect(h.sqft).toBe('2130');
+    expect(h.propertyID).toBe('171400');
+    expect(h.hoa).toBeNull();
+    expect(h.latitude).toBeCloseTo(47.5682814, 4);
+  });
+
+  it('returns null rather than a partial record when the rental stat blocks are absent', () => {
+    document.querySelectorAll('.stat-block').forEach((el) => el.remove());
+    // Falls through to the for-sale branch, which also finds nothing here.
+    expect(RedfinAdapter.extractFromDetailPage()).toBeNull();
   });
 });
 
@@ -408,6 +531,42 @@ describe('ZillowAdapter - detail page', () => {
   it('is not fooled into detail mode on a results page', () => {
     setLocation('https://www.zillow.com/shoreline-wa/');
     expect(ZillowAdapter.isDetailPage()).toBe(false);
+  });
+});
+
+describe('ZillowAdapter - rental listing detail page', () => {
+  /**
+   * Verified live 2026-07-29: a Zillow rental's own detail page still publishes a
+   * RealEstateListing ld+json blob with a numeric offers.price (no "/mo" anywhere in
+   * it), the same as a for-sale listing's. isRentalDetailPage has to read the
+   * *rendered* price text instead, or every rental detail page looks exactly like a
+   * for-sale one to it.
+   */
+  beforeEach(() => {
+    setLocation('https://www.zillow.com/homedetails/918-W-Fullerton-Ave-APT-2-Chicago-IL-60614/3730740_zpid/');
+    document.body.innerHTML = `
+      <h1>918 W Fullerton Ave, APT 2, Chicago, IL 60614</h1>
+      <span data-testid="price">$3,500/mo</span>
+      <script type="application/ld+json">
+        {"@type":["RealEstateListing","Product"],"url":"https://www.zillow.com/homedetails/918-W-Fullerton-Ave-APT-2-Chicago-IL-60614/3730740_zpid/","offers":{"price":3500}}
+      </script>
+    `;
+  });
+
+  it('identifies itself as a rental from the rendered price text', () => {
+    expect(ZillowAdapter.isRentalDetailPage!()).toBe(true);
+  });
+
+  // The trap: extractFromDetailPage's own price is the clean ld+json number, which
+  // carries no "/mo" -- isRentalDetailPage must not be built on top of it.
+  it('is a rental even though extractFromDetailPage\'s own price has no "/mo"', () => {
+    expect(ZillowAdapter.extractFromDetailPage()!.price).toBe('3500');
+    expect(ZillowAdapter.isRentalDetailPage!()).toBe(true);
+  });
+
+  it('does not misidentify a for-sale detail page as a rental', () => {
+    document.querySelector('[data-testid="price"]')!.textContent = '$774,950';
+    expect(ZillowAdapter.isRentalDetailPage!()).toBe(false);
   });
 });
 
@@ -587,6 +746,31 @@ describe('ZillowAdapter - results page cards', () => {
     const card = ZillowAdapter.findCardElements()[0];
     card.querySelector('a')!.removeAttribute('href');
     expect(ZillowAdapter.extractFromCard(card)!.propertyID).toBe('48703301');
+  });
+});
+
+describe('ZillowAdapter - compFacts (comp search cards)', () => {
+  beforeEach(() => {
+    setLocation('https://www.zillow.com/homes/recently_sold/78745_rb/3-3_beds/2-_baths/');
+    document.body.innerHTML =
+      '<article id="zpid_48703301">'
+      + '<a href="/homedetails/1615-N-196th-Pl-Shoreline-WA-98133/48703301_zpid/">x</a>'
+      + '<span data-testid="property-card-price">$--</span>'
+      + '</article>';
+  });
+
+  // Zillow renders no separate price-label text -- the non-disclosure "$--" is the
+  // whole signal -- so priceLabel is always null and the amount itself is what the
+  // caller (parseCompAmount) has to recognise as unusable.
+  it('reads the amount text with no price label', () => {
+    const card = ZillowAdapter.findCardElements()[0];
+    const facts = ZillowAdapter.compFacts!(card)!;
+    expect(facts.amountText).toBe('$--');
+    expect(facts.priceLabel).toBeNull();
+  });
+
+  it('returns null without a card element', () => {
+    expect(ZillowAdapter.compFacts!(null as unknown as Element)).toBeNull();
   });
 });
 

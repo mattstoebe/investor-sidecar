@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error -- plain JS module shipped as-is to the service worker, no types.
-import { houseKey, mergeEnrichmentIntoLatest, applyLocalParams, stampRevision } from '../public/scripts/house-storage.js';
+import { houseKey, mergeEnrichmentIntoLatest, applyLocalParams, stampRevision, addCompToHouse, removeCompFromHouse, compKey, applyUndoEntry } from '../public/scripts/house-storage.js';
 
 /**
  * These cover the write path that protects panel edits from asynchronous API
@@ -260,5 +260,141 @@ describe('enrichment revisions', () => {
     const result = mergeEnrichmentIntoLatest([house({ rev: 3 })], 'redfin:30926649', enrichment());
     expect(result.updatedHouse.rev).toBe(4);
     expect(result.updatedHouse.lastWriter).toBe('enrichment');
+  });
+});
+
+/**
+ * Comps. The single most important property of these two functions is the one rule
+ * A1 in docs/comp-workflow.md exists for: unlike every other write in this file, they
+ * must never bump `rev`. A comp add stamped as a revision would make a mounted card's
+ * useHouseParams adopt it as a foreign write and discard whatever the user is
+ * mid-typing in another field -- "editing the panel while clicking comps in another
+ * tab" is this feature's core workflow, not an edge case.
+ */
+const comp = (over: Record<string, unknown> = {}) => ({
+  source: 'redfin', propertyID: '555', kind: 'rent', address: '456 Comp Ave',
+  amount: 2100, amountLabel: 'rent', beds: '3', baths: '2', sqft: '1400',
+  url: 'https://www.redfin.com/x/455/home/555', soldDate: null, capturedAt: 1_000,
+  ...over
+});
+
+describe('addCompToHouse', () => {
+  it('appends a comp to the matching house', () => {
+    const houses = [house({ rev: 4 })];
+    const result = addCompToHouse(houses, 'redfin:30926649', comp());
+
+    expect(result.duplicate).toBe(false);
+    expect(result.updatedHouse.comps).toHaveLength(1);
+    expect(result.updatedHouse.comps[0].address).toBe('456 Comp Ave');
+  });
+
+  // Rule A1: the load-bearing assertion for this whole feature.
+  it('leaves rev and lastWriter untouched', () => {
+    const houses = [house({ rev: 4, lastWriter: 'card-1' })];
+    const result = addCompToHouse(houses, 'redfin:30926649', comp());
+
+    expect(result.updatedHouse.rev).toBe(4);
+    expect(result.updatedHouse.lastWriter).toBe('card-1');
+  });
+
+  it('adding the same comp twice yields one comp, not two', () => {
+    const houses = [house({ comps: [comp()] })];
+    const result = addCompToHouse(houses, 'redfin:30926649', comp());
+
+    expect(result.duplicate).toBe(true);
+    expect(result.updatedHouse.comps).toHaveLength(1);
+  });
+
+  it('distinguishes comps by kind, so a rent and sold comp for the same listing can coexist', () => {
+    const houses = [house({ comps: [comp({ kind: 'rent' })] })];
+    const result = addCompToHouse(houses, 'redfin:30926649', comp({ kind: 'sold' }));
+
+    expect(result.duplicate).toBe(false);
+    expect(result.updatedHouse.comps).toHaveLength(2);
+  });
+
+  it('returns null when the house is gone', () => {
+    expect(addCompToHouse([], 'redfin:30926649', comp())).toBeNull();
+  });
+
+  it('does not mutate the array or house it was given', () => {
+    const original = house({ comps: [] });
+    const houses = [original];
+    const snapshot = JSON.stringify(houses);
+
+    addCompToHouse(houses, 'redfin:30926649', comp());
+
+    expect(JSON.stringify(houses)).toBe(snapshot);
+  });
+});
+
+describe('removeCompFromHouse', () => {
+  it('removes the named comp and leaves the rest', () => {
+    const houses = [house({
+      comps: [comp({ propertyID: '555' }), comp({ propertyID: '556' })]
+    })];
+    const result = removeCompFromHouse(houses, 'redfin:30926649', compKey(comp({ propertyID: '555' })));
+
+    expect(result.updatedHouse.comps).toHaveLength(1);
+    expect(result.updatedHouse.comps[0].propertyID).toBe('556');
+  });
+
+  it('leaves rev and lastWriter untouched', () => {
+    const houses = [house({ rev: 7, lastWriter: 'card-2', comps: [comp()] })];
+    const result = removeCompFromHouse(houses, 'redfin:30926649', compKey(comp()));
+
+    expect(result.updatedHouse.rev).toBe(7);
+    expect(result.updatedHouse.lastWriter).toBe('card-2');
+  });
+
+  it('returns null when the comp is already gone', () => {
+    const houses = [house({ comps: [] })];
+    expect(removeCompFromHouse(houses, 'redfin:30926649', compKey(comp()))).toBeNull();
+  });
+
+  it('returns null when the house is gone', () => {
+    expect(removeCompFromHouse([], 'redfin:30926649', compKey(comp()))).toBeNull();
+  });
+});
+
+describe('applyUndoEntry: comp removal', () => {
+  const compEntry = (over: Record<string, unknown> = {}) => ({
+    op: 'comp', key: 'redfin:30926649', index: 0, label: 'Removed a comp',
+    localParams: null, house: null, comps: [comp()], at: 1_000, ...over
+  });
+
+  it('restores the prior comps list', () => {
+    const houses = [house({ comps: [] })];
+    const result = applyUndoEntry(houses, compEntry());
+    expect(result.updatedHouses[0].comps).toHaveLength(1);
+    expect(result.updatedHouses[0].comps[0].propertyID).toBe('555');
+  });
+
+  // The other half of rule A1: the undo path is exactly where a copy-pasted branch
+  // would silently reintroduce a stampRevision call.
+  it('does not bump rev, unlike every other undo branch', () => {
+    const houses = [house({ rev: 4, lastWriter: 'card-1', comps: [] })];
+    const result = applyUndoEntry(houses, compEntry());
+    expect(result.updatedHouses[0].rev).toBe(4);
+    expect(result.updatedHouses[0].lastWriter).toBe('card-1');
+  });
+
+  it('declines when the house is gone', () => {
+    expect(applyUndoEntry([], compEntry())).toBeNull();
+  });
+
+  it('does not mutate the array it was given', () => {
+    const houses = [house({ comps: [] })];
+    const snapshot = JSON.stringify(houses);
+    applyUndoEntry(houses, compEntry());
+    expect(JSON.stringify(houses)).toBe(snapshot);
+  });
+});
+
+describe('compKey', () => {
+  it('namespaces by source, propertyID and kind', () => {
+    expect(compKey({ source: 'redfin', propertyID: '555', kind: 'rent' })).toBe('redfin:555:rent');
+    expect(compKey({ source: 'redfin', propertyID: '555', kind: 'sold' }))
+      .not.toBe(compKey({ source: 'redfin', propertyID: '555', kind: 'rent' }));
   });
 });
