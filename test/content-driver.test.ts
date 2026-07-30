@@ -27,6 +27,13 @@ interface Driver {
   ensureCalculatorOnDetailPage(): void;
   ensureCalculatorOnCard(cardEl: Element): void;
   setCompSession(session: unknown): void;
+  reconcileMapPins(): void;
+  sweepMapPins(): void;
+  setShowHousesOnMap(value: boolean): void;
+  setStoredHousesForMap(houses: unknown[]): void;
+  mapHouseKey(house: unknown): string;
+  installMapPinInterceptors(): void;
+  sendMessageCalls: Array<Record<string, unknown>>;
   StorageManager: {
     saveHouse(house: unknown): Promise<{ ok: boolean; reason?: string; added?: boolean }>;
   };
@@ -69,20 +76,30 @@ function loadDriver(siteStub?: Record<string, unknown>): Driver {
       injectInto, createCalculatorElement, ensureCalculatorStyles, ensureCalculatorOnDetailPage,
       ensureCalculatorOnCard,
       setCompSession: (s) => { compSession = s; },
+      reconcileMapPins, sweepMapPins, mapHouseKey, installMapPinInterceptors,
+      setShowHousesOnMap: (v) => { showHousesOnMap = v; },
+      setStoredHousesForMap: (h) => { storedHousesForMap = h; },
       StorageManager, buildComp
     };`
   );
   // The driver registers a runtime message listener at load and messages the worker on
   // capture; neither is the subject here. The adapters are real files loaded separately by
   // the manifest -- this suite covers the driver, so a host-matching stub is enough.
+  const sendMessageCalls: Array<Record<string, unknown>> = [];
   const chromeStub = {
     runtime: {
       onMessage: { addListener: () => {} },
-      sendMessage: async () => ({ ok: true, added: true })
+      sendMessage: async (message: Record<string, unknown>) => {
+        sendMessageCalls.push(message);
+        return { ok: true, added: true };
+      },
+      lastError: undefined as unknown
     }
   };
   const adapterStub = { matchesHost: () => false };
-  return factory(chromeStub, adapterStub, adapterStub, adapterStub) as Driver;
+  const driver = factory(chromeStub, adapterStub, adapterStub, adapterStub) as Driver;
+  driver.sendMessageCalls = sendMessageCalls;
+  return driver;
 }
 
 let driver: Driver;
@@ -639,5 +656,175 @@ describe('buildComp respects an adapter-declared id rule', () => {
     const result = d.buildComp(houseData, facts, session);
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/identify this listing from its card/i);
+  });
+});
+
+/**
+ * Map pins (docs/map-linking.md Option 3): content.js owns reconciling saved houses
+ * against the current map, using whatever projection the site adapter hands back. These
+ * tests stub the adapter's buildMapProjection/projectPoint/mapPinContainer entirely --
+ * the real Redfin/Zillow projection math is covered in site-adapters.test.ts and
+ * geo-projection.test.ts. What's under test here is the driver's own logic: the on/off
+ * toggle, the viewport-membership filter, add/move/remove reconciliation, and the click
+ * -> message wiring -- none of which depends on which site produced the projection.
+ */
+describe('map pins', () => {
+  function mockRect(el: HTMLElement, rect: { width: number; height: number }) {
+    el.getBoundingClientRect = () => ({
+      left: 0, top: 0, right: rect.width, bottom: rect.height, x: 0, y: 0,
+      width: rect.width, height: rect.height, toJSON() { return this; }
+    });
+  }
+
+  function mapSite() {
+    const container = document.createElement('div');
+    mockRect(container, { width: 1000, height: 800 });
+    document.body.appendChild(container);
+    return {
+      id: 'stub',
+      mapPinContainer: () => container,
+      // A trivial 1:1 "projection": lat/lon doubles as x/y, so tests can place a house
+      // in or out of the container's rect just by choosing its coordinates.
+      buildMapProjection: () => ({ container, fit: null }),
+      projectPoint: (_projection: unknown, lat: number, lon: number) => ({ x: lat, y: lon })
+    };
+  }
+
+  const houseA = { source: 'redfin', propertyID: 'A1', address: '1 Main St', latitude: 100, longitude: 100 };
+  const houseB = { source: 'zillow', propertyID: 'B2', address: '2 Main St', latitude: 900, longitude: 700 };
+  // Projects to (5000, 5000) -- outside the 1000x800 container plus margin.
+  const houseOffscreen = { source: 'redfin', propertyID: 'C3', address: '3 Main St', latitude: 5000, longitude: 5000 };
+
+  it('draws nothing and reports nothing while the toggle is off', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(false);
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(0);
+  });
+
+  it('draws nothing for a site with no buildMapProjection (e.g. Homes.com, unsupported for now)', () => {
+    const d = loadDriver({ id: 'homes' });
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA]);
+    expect(() => d.reconcileMapPins()).not.toThrow();
+  });
+
+  it('places one pin per saved house with real coordinates inside the viewport', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA, houseB]);
+    d.reconcileMapPins();
+
+    const pins = site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]');
+    expect(pins).toHaveLength(2);
+  });
+
+  it('skips a house with no coordinates', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([{ ...houseA, latitude: null, longitude: null }]);
+    d.reconcileMapPins();
+
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(0);
+  });
+
+  // The core of the off-viewport decision: never pan or zoom the site's own map to bring
+  // a saved house into view (docs/map-linking.md, anti-bot posture) -- a house that
+  // projects outside the container's own rect just gets no pin, silently.
+  it('never draws a pin for a house that projects outside the map container', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA, houseOffscreen]);
+    d.reconcileMapPins();
+
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(1);
+    expect(d.mapHouseKey(houseOffscreen)).not.toBe(d.mapHouseKey(houseA));
+  });
+
+  it('moves an existing pin rather than recreating it when its house is reconciled again', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+    const firstEl = site.mapPinContainer().querySelector('[data-sidecar-pin="1"]');
+
+    d.setStoredHousesForMap([{ ...houseA, latitude: 200, longitude: 200 }]);
+    d.reconcileMapPins();
+    const secondEl = site.mapPinContainer().querySelector('[data-sidecar-pin="1"]');
+
+    expect(secondEl).toBe(firstEl); // same node, moved
+    expect((secondEl as HTMLElement).style.left).toBe('200px');
+  });
+
+  it('removes a pin whose house is no longer saved', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA, houseB]);
+    d.reconcileMapPins();
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(2);
+
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(1);
+  });
+
+  it('sweeps every pin immediately when asked, regardless of the toggle', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(1);
+
+    d.sweepMapPins();
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(0);
+  });
+
+  it('reports how many of the saved houses with coordinates are currently shown', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA, houseB, houseOffscreen]);
+    d.reconcileMapPins();
+
+    const status = d.sendMessageCalls.find((m) => m.action === 'mapPinStatus');
+    expect(status).toMatchObject({ shown: 2, total: 3 });
+  });
+
+  it('sends mapPinClicked with the house key and swallows the click', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.installMapPinInterceptors();
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+
+    const pin = site.mapPinContainer().querySelector('[data-sidecar-pin="1"]')!;
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+    pin.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    const clicked = d.sendMessageCalls.find((m) => m.action === 'mapPinClicked');
+    expect(clicked).toMatchObject({ key: d.mapHouseKey(houseA) });
+  });
+
+  it('does not intercept a click that lands outside any of our pins', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.installMapPinInterceptors();
+
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+    site.mapPinContainer().dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(d.sendMessageCalls.find((m) => m.action === 'mapPinClicked')).toBeUndefined();
   });
 });

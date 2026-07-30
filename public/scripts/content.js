@@ -152,6 +152,31 @@ function ensureCalculatorStyles() {
         z-index: 2147483647;
         pointer-events: none;
       }
+
+      /* Our own pins on their map (docs/map-linking.md Option 3). A small purple dot,
+         not a full teardrop marker: with no confirmed anchor convention for either
+         site's own pins, a symmetric dot centered on the projected point degrades
+         gracefully if that point is off by a few px, where an asymmetric pin shape
+         would visibly point at the wrong spot. */
+      .sidecar-MapPin {
+        position: absolute;
+        width: 14px;
+        height: 14px;
+        margin: -7px 0 0 -7px;
+        border-radius: 50%;
+        background: #6D28D9;
+        border: 2px solid #fff;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+        cursor: pointer;
+        pointer-events: auto;
+      }
+      .sidecar-MapPin:hover,
+      .sidecar-MapPin:focus-visible {
+        width: 18px;
+        height: 18px;
+        margin: -9px 0 0 -9px;
+        outline: none;
+      }
     `;
   document.head.appendChild(style);
 }
@@ -809,6 +834,223 @@ function isOurNode(node) {
   return node.nodeType === 1 && node.dataset?.sidecar === '1';
 }
 
+/**
+ * Map pins (docs/map-linking.md Option 3): puts our own marker on the site's live map
+ * for every saved house with real coordinates -- regardless of which site captured it,
+ * since the projection only needs a lat/lon and the site's own current map. Deliberately
+ * never pans or zooms the site's own map; a house whose projected point falls outside
+ * the visible map container simply gets no pin (see reconcileMapPins below), which is
+ * the "N of M houses shown on this map" the panel surfaces rather than a forced move.
+ *
+ * Off entirely for a site whose adapter has no buildMapProjection (Homes.com, for now).
+ */
+const MAP_PIN_SELECTOR = '[data-sidecar-pin="1"]';
+
+/** Mirrors house-storage.js's houseKey(). Duplicated, not imported: content scripts run
+ *  as plain scripts, not ES modules, so they can't import the background worker's module.
+ *  Keep this in sync with house-storage.js if that format ever changes. */
+function mapHouseKey(house) {
+  return `${house?.source || 'redfin'}:${house?.propertyID}`;
+}
+
+function hasMapCoords(house) {
+  return Number.isFinite(house?.latitude) && Number.isFinite(house?.longitude);
+}
+
+let showHousesOnMap = false;
+let storedHousesForMap = [];
+let mapReconcileTimer = null;
+let mapObserver = null;
+let mapObserverContainer = null;
+let lastReportedMapStatus = null;
+
+function sweepMapPins() {
+  document.querySelectorAll(MAP_PIN_SELECTOR).forEach((el) => el.remove());
+}
+
+function reportMapStatus(shown, total) {
+  if (lastReportedMapStatus && lastReportedMapStatus.shown === shown && lastReportedMapStatus.total === total) {
+    return;
+  }
+  lastReportedMapStatus = { shown, total };
+  chrome.runtime.sendMessage({ action: 'mapPinStatus', shown, total }, () => { void chrome.runtime.lastError; });
+}
+
+function createMapPinElement(house, point) {
+  const pin = document.createElement('div');
+  pin.dataset.sidecar = '1';
+  pin.dataset.sidecarPin = '1';
+  pin.dataset.sidecarHouseKey = mapHouseKey(house);
+  pin.className = 'sidecar-MapPin';
+  pin.setAttribute('role', 'button');
+  pin.setAttribute('tabindex', '0');
+  pin.setAttribute('aria-label', `Show ${house.address || 'this house'} in Investor Sidecar`);
+  pin.style.left = `${point.x}px`;
+  pin.style.top = `${point.y}px`;
+  return pin;
+}
+
+/**
+ * Watches the site's own map-pin container for changes (a pan or zoom rewrites every
+ * native pin's position) and schedules a reconcile in response, the same debounced
+ * pattern the button-injection observer below uses. Own-mutation filtering mirrors
+ * isOurNode's use in that observer: without it, moving our own pins would retrigger
+ * this observer, which would move them again, forever.
+ */
+function ensureMapObserver(container) {
+  if (mapObserver && mapObserverContainer === container) return;
+  mapObserver?.disconnect();
+  mapObserver = null;
+  mapObserverContainer = container;
+  if (!container) return;
+
+  mapObserver = new MutationObserver((records) => {
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i];
+      if (record.type === 'attributes') {
+        if (!isOurNode(record.target)) return scheduleMapReconcile();
+        continue;
+      }
+      const added = record.addedNodes;
+      for (let j = 0; j < added.length; j++) {
+        if (!isOurNode(added[j])) return scheduleMapReconcile();
+      }
+      const removed = record.removedNodes;
+      for (let j = 0; j < removed.length; j++) {
+        if (!isOurNode(removed[j])) return scheduleMapReconcile();
+      }
+    }
+  });
+  mapObserver.observe(container, { attributes: true, attributeFilter: ['style'], childList: true, subtree: true });
+}
+
+function scheduleMapReconcile() {
+  clearTimeout(mapReconcileTimer);
+  mapReconcileTimer = setTimeout(reconcileMapPins, 80);
+}
+
+/**
+ * The one function that decides what's on the map. Rebuilds the projection, then adds,
+ * moves or removes pins to match exactly the set of saved houses whose projected point
+ * currently falls inside the map container's own visible rect -- a margin allows a pin
+ * anchored near the edge to stay rather than flicker out a few px early.
+ */
+function reconcileMapPins() {
+  if (!showHousesOnMap || typeof site?.buildMapProjection !== 'function') {
+    sweepMapPins();
+    ensureMapObserver(null);
+    reportMapStatus(0, 0);
+    return;
+  }
+
+  const candidates = storedHousesForMap.filter(hasMapCoords);
+  const projection = site.buildMapProjection();
+  ensureMapObserver(typeof site.mapPinContainer === 'function' ? site.mapPinContainer() : null);
+
+  if (!projection) {
+    sweepMapPins();
+    reportMapStatus(0, candidates.length);
+    return;
+  }
+
+  const container = projection.container;
+  const rect = container.getBoundingClientRect();
+  const margin = 24;
+
+  const placed = new Map();
+  for (const house of candidates) {
+    const point = site.projectPoint(projection, house.latitude, house.longitude);
+    if (!point) continue;
+    if (point.x < -margin || point.x > rect.width + margin || point.y < -margin || point.y > rect.height + margin) {
+      continue;
+    }
+    placed.set(mapHouseKey(house), { house, point });
+  }
+
+  const existing = new Map();
+  container.querySelectorAll(MAP_PIN_SELECTOR).forEach((el) => existing.set(el.dataset.sidecarHouseKey, el));
+
+  for (const [key, el] of existing) {
+    if (!placed.has(key)) el.remove();
+  }
+  for (const [key, { house, point }] of placed) {
+    const el = existing.get(key);
+    if (el) {
+      el.style.left = `${point.x}px`;
+      el.style.top = `${point.y}px`;
+    } else {
+      container.appendChild(createMapPinElement(house, point));
+    }
+  }
+
+  reportMapStatus(placed.size, candidates.length);
+}
+
+async function refreshShowHousesOnMap() {
+  try {
+    const result = await chrome.storage.local.get('showHousesOnMap');
+    showHousesOnMap = Boolean(result.showHousesOnMap);
+  } catch {
+    showHousesOnMap = false;
+  }
+  scheduleMapReconcile();
+}
+
+async function refreshStoredHousesForMap() {
+  try {
+    const result = await chrome.storage.local.get('storedHouses');
+    storedHousesForMap = Array.isArray(result.storedHouses) ? result.storedHouses : [];
+  } catch {
+    storedHousesForMap = [];
+  }
+  scheduleMapReconcile();
+}
+
+/**
+ * Swallows clicks on our own pins before the site's own map click handling sees them --
+ * same rationale and same document-level capture-phase approach as
+ * installButtonInterceptors above (see its comment for why capture-phase specifically).
+ */
+let mapPinInterceptorsInstalled = false;
+
+function installMapPinInterceptors() {
+  if (mapPinInterceptorsInstalled) return;
+  mapPinInterceptorsInstalled = true;
+
+  const ourPin = (e) => {
+    const target = e.target;
+    return target instanceof Element ? target.closest(MAP_PIN_SELECTOR) : null;
+  };
+
+  const activate = (pin) => {
+    chrome.runtime.sendMessage(
+      { action: 'mapPinClicked', key: pin.dataset.sidecarHouseKey },
+      () => { void chrome.runtime.lastError; }
+    );
+  };
+
+  document.addEventListener('click', (e) => {
+    const pin = ourPin(e);
+    if (!pin) return;
+    consumeEvent(e);
+    activate(pin);
+  }, true);
+
+  for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup']) {
+    document.addEventListener(type, (e) => {
+      if (ourPin(e)) consumeEvent(e);
+    }, true);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const pin = ourPin(e);
+    if (!pin) return;
+    consumeEvent(e);
+    activate(pin);
+  }, true);
+}
+
 const init = () => {
   if (!site) return;
 
@@ -896,8 +1138,19 @@ const init = () => {
   // session's tab closing, or a fresh session replacing it, all of which the worker
   // expresses as one write to the same storage key.
   refreshCompSession();
+
+  // Map pins. Both the toggle and the house list are read directly from storage rather
+  // than messaged in, and kept fresh the same reactive way compSession is: on load and
+  // on every relevant storage.onChanged.
+  installMapPinInterceptors();
+  refreshShowHousesOnMap();
+  refreshStoredHousesForMap();
+
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && 'compSession' in changes) refreshCompSession();
+    if (area !== 'local') return;
+    if ('compSession' in changes) refreshCompSession();
+    if ('showHousesOnMap' in changes) refreshShowHousesOnMap();
+    if ('storedHouses' in changes) refreshStoredHousesForMap();
   });
 
   window.__investorSidecarLogView = () => {
@@ -906,6 +1159,7 @@ const init = () => {
     console.log(site.diagnostics());
     console.log('injected buttons:', document.querySelectorAll('.bp-CalculatorExtension').length);
     console.log('comp session:', compSession);
+    console.log('map pins: showHousesOnMap =', showHousesOnMap, ', last status =', lastReportedMapStatus);
     console.groupEnd();
   };
 };

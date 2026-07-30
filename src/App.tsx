@@ -67,8 +67,9 @@ export interface House {
   sqft: string;
   propertyID: string;
   url: string;
-  latitude: number;
-  longitude: number;
+  /** Absent (null) on any house captured from a Zillow results card -- see zillow.js. */
+  latitude: number | null;
+  longitude: number | null;
   /**
    * Written by the tax/rent service, which was removed before the store release and is
    * coming back with real auth (see the header of public/scripts/background.js). Nothing
@@ -794,14 +795,22 @@ function CompSummary({ comps, onPick, onRemove }: {
   );
 }
 
-export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
+export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highlighted }: {
   house: House,
   globalParams: GlobalParameters,
   /** Lets the panel offer to undo the removal; the card itself has no toast. */
   onRemoved?: (address: string) => void,
   /** Same, for a strategy switch -- the other thing worth taking back. */
-  onModeChanged?: (label: string) => void
+  onModeChanged?: (label: string) => void,
+  /** Set for a moment after clicking this house's pin on the site's own map
+   *  (docs/map-linking.md Option 3) -- see the highlightHouse listener in App(). */
+  highlighted?: boolean
 }) {
+  const cardRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (highlighted) cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [highlighted]);
+
   // One open section, keyed by id. Three independent booleans could not survive a mode with
   // four sections, and let two dropdowns be open at once on a 320px panel.
   const [openSection, setOpenSection] = useState<string | null>(null);
@@ -1364,9 +1373,12 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged }: {
   // rather than rendering nothing and leaving you to guess.
   return (
     <div
+      ref={cardRef}
       data-testid="house-card"
       data-property-id={house.propertyID}
-      className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg mb-4 text-gray-700 dark:text-gray-300 shadow-sm border border-gray-200 dark:border-gray-700"
+      className={`bg-gray-50 dark:bg-gray-800 p-4 rounded-lg mb-4 text-gray-700 dark:text-gray-300 shadow-sm border transition-colors ${
+        highlighted ? 'border-purple-500 ring-2 ring-purple-400' : 'border-gray-200 dark:border-gray-700'
+      }`}
     >
       <div>
         <div className="space-y-3">
@@ -1601,6 +1613,25 @@ function SidePanel() {
   const [undoState, setUndoState] = useState<UndoSummary>({ depth: 0, label: null });
   /** What the toast is currently offering to undo. Null hides it. */
   const [toast, setToast] = useState<string | null>(null);
+  /** Mirrors chrome.storage.local's showHousesOnMap -- content.js reads that key directly
+   *  (docs/map-linking.md Option 3), so this panel is a plain writer, not the owner. */
+  const [showHousesOnMap, setShowHousesOnMap] = useState(false);
+  /** Set by a click on one of our pins on the site's own map; cleared a few seconds later
+   *  so the ring is a flash, not a permanent marker. */
+  const [highlightedHouseKey, setHighlightedHouseKey] = useState<string | null>(null);
+  /** How many saved-with-coordinates houses are currently pinned on the visible map, from
+   *  the content script's own reconciliation -- null until one ever reports in. */
+  const [mapStatus, setMapStatus] = useState<{ shown: number; total: number } | null>(null);
+
+  useEffect(() => {
+    if (!highlightedHouseKey) return;
+    const timer = setTimeout(() => setHighlightedHouseKey(null), 3000);
+    return () => clearTimeout(timer);
+  }, [highlightedHouseKey]);
+
+  useEffect(() => {
+    chrome.storage.local.set({ showHousesOnMap });
+  }, [showHousesOnMap]);
 
   const requestUndo = useCallback(async () => {
     setToast(null);
@@ -1662,6 +1693,25 @@ function SidePanel() {
         // entry was, which is enough to label a button and not enough to write one.
         const undo = (message as { undo?: UndoSummary }).undo;
         if (undo) setUndoState(undo);
+        return;
+      }
+
+      if (
+        typeof message === 'object' && message !== null &&
+        (message as { action?: string }).action === 'highlightHouse'
+      ) {
+        const key = (message as { key?: unknown }).key;
+        if (typeof key === 'string') setHighlightedHouseKey(key);
+        return;
+      }
+
+      if (
+        typeof message === 'object' && message !== null &&
+        (message as { action?: string }).action === 'mapPinStatus'
+      ) {
+        const shown = (message as { shown?: unknown }).shown;
+        const total = (message as { total?: unknown }).total;
+        if (typeof shown === 'number' && typeof total === 'number') setMapStatus({ shown, total });
       }
     };
 
@@ -1688,6 +1738,30 @@ function SidePanel() {
         parameters={globalParams} 
         setParameters={setGlobalParams}
       />
+      {houses.length > 0 && (
+        <div className="flex items-center gap-2 mb-3">
+          <button
+            type="button"
+            onClick={() => setShowHousesOnMap((v) => !v)}
+            aria-pressed={showHousesOnMap}
+            className={`text-sm rounded px-2 py-1 border transition-colors ${
+              showHousesOnMap
+                ? 'bg-purple-600 border-purple-600 text-white'
+                : 'bg-white dark:bg-gray-800 border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200'
+            }`}
+          >
+            {showHousesOnMap ? 'Showing on map' : 'Show on map'}
+          </button>
+          {/* Never a claim that every saved house is pinned -- off-viewport houses are
+              never forced into view (docs/map-linking.md, anti-bot posture), so this is
+              the honest alternative to a silent gap. */}
+          {showHousesOnMap && mapStatus && (
+            <span className="text-xs text-gray-500 dark:text-gray-400">
+              {mapStatus.shown} of {mapStatus.total} shown on this map
+            </span>
+          )}
+        </div>
+      )}
       {houses.length > 1 && (
         // min-w-0 on the select's container lets it shrink instead of overflowing the
         // panel; the label is short enough to stay on one line at panel width.
@@ -1718,6 +1792,7 @@ function SidePanel() {
               globalParams={globalParams}
               onRemoved={(address) => setToast(`Removed ${address}`)}
               onModeChanged={(label) => setToast(`Switched to ${label}`)}
+              highlighted={highlightedHouseKey === houseKey(house)}
             />
           ))
         ) : (

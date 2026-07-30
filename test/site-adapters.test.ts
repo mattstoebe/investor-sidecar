@@ -18,7 +18,7 @@ import { resolve } from 'node:path';
  */
 function loadAdapters() {
   const read = (p: string) => readFileSync(resolve(__dirname, '../public/scripts/sites/', p), 'utf8');
-  const bundle = [read('parsers.js'), read('redfin.js'), read('zillow.js')].join(';\n');
+  const bundle = [read('parsers.js'), read('geo-projection.js'), read('redfin.js'), read('zillow.js')].join(';\n');
   // Evaluated in this realm so the adapters see jsdom's document/window.
   const factory = new Function(`${bundle}; return { SidecarParsers, RedfinAdapter, ZillowAdapter };`);
   return factory() as {
@@ -60,6 +60,9 @@ interface SiteAdapter {
   extraInjectionTargets(): unknown[];
   compFacts?(el: Element): { amountText: string | null; priceLabel: string | null; soldDateText: string } | null;
   isRentalDetailPage?(): boolean;
+  mapPinContainer?(): Element | null;
+  buildMapProjection?(): { container: Element; fit: unknown } | null;
+  projectPoint?(projection: unknown, lat: number, lon: number): { x: number; y: number } | null;
 }
 
 let RedfinAdapter: SiteAdapter;
@@ -381,6 +384,64 @@ describe('RedfinAdapter - rental listing detail page (third template)', () => {
     document.querySelectorAll('.stat-block').forEach((el) => el.remove());
     // Falls through to the for-sale branch, which also finds nothing here.
     expect(RedfinAdapter.extractFromDetailPage()).toBeNull();
+  });
+});
+
+describe('RedfinAdapter - map pin projection', () => {
+  /** A pin as Redfin actually renders one: attributes for identity, inline left/top for position. */
+  function pin(lat: number, lon: number, x: number, y: number) {
+    const el = document.createElement('div');
+    el.className = 'Pushpin';
+    el.setAttribute('latitude', String(lat));
+    el.setAttribute('longitude', String(lon));
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    return el;
+  }
+
+  it('returns null with no map container on the page', () => {
+    document.body.innerHTML = '<div class="bp-Homecard__Content"></div>';
+    expect(RedfinAdapter.mapPinContainer!()).toBeNull();
+    expect(RedfinAdapter.buildMapProjection!()).toBeNull();
+  });
+
+  it('returns null with fewer than two usable pins', () => {
+    document.body.innerHTML = '<div class="HomeMarkersContainer"></div>';
+    document.querySelector('.HomeMarkersContainer')!.appendChild(pin(30.27, -97.74, 400, 300));
+    expect(RedfinAdapter.buildMapProjection!()).toBeNull();
+  });
+
+  it('fits a projection from two on-screen pins and reproduces a third pin\'s position', () => {
+    document.body.innerHTML = '<div class="HomeMarkersContainer"></div>';
+    const container = document.querySelector('.HomeMarkersContainer')!;
+    // Real coordinates all fall on the same Austin page as docs/map-linking.md's recon.
+    container.appendChild(pin(30.2672, -97.7431, 400, 300));
+    container.appendChild(pin(30.3072, -97.7031, 600, 100));
+    container.appendChild(pin(30.2872, -97.7231, 500, 200)); // held out; checked below
+
+    const projection = RedfinAdapter.buildMapProjection!()!;
+    expect(projection).not.toBeNull();
+    // The third pin was not used as an anchor (min/max longitude picks the other two),
+    // so reproducing its position close to (500, 200) is a real check, not a tautology.
+    const result = RedfinAdapter.projectPoint!(projection, 30.2872, -97.7231)!;
+    expect(result.x).toBeCloseTo(500, 0);
+    expect(result.y).toBeCloseTo(200, 0);
+  });
+
+  it('ignores pins with missing or non-numeric geometry', () => {
+    document.body.innerHTML = '<div class="HomeMarkersContainer"></div>';
+    const container = document.querySelector('.HomeMarkersContainer')!;
+    container.appendChild(pin(30.2672, -97.7431, 400, 300));
+    const broken = document.createElement('div');
+    broken.className = 'Pushpin';
+    broken.setAttribute('latitude', 'not-a-number');
+    broken.setAttribute('longitude', '-97.7');
+    container.appendChild(broken);
+    expect(RedfinAdapter.buildMapProjection!()).toBeNull();
+  });
+
+  it('projectPoint no-ops to null on a null projection', () => {
+    expect(RedfinAdapter.projectPoint!(null, 30.27, -97.74)).toBeNull();
   });
 });
 
@@ -746,6 +807,203 @@ describe('ZillowAdapter - results page cards', () => {
     const card = ZillowAdapter.findCardElements()[0];
     card.querySelector('a')!.removeAttribute('href');
     expect(ZillowAdapter.extractFromCard(card)!.propertyID).toBe('48703301');
+  });
+
+  it('has no coordinates without a __NEXT_DATA__ payload', () => {
+    const card = ZillowAdapter.findCardElements()[0];
+    const h = ZillowAdapter.extractFromCard(card)!;
+    expect(h.latitude).toBeNull();
+    expect(h.longitude).toBeNull();
+  });
+});
+
+/**
+ * A results-page card carries no coordinates in its own DOM (verified live,
+ * docs/map-linking.md §2) -- they have to be looked up in the search payload embedded
+ * in __NEXT_DATA__, matched by zpid. This used to be hardcoded null unconditionally,
+ * which blocked both rent estimation and the map-pin feature for every Zillow card
+ * capture.
+ */
+describe('ZillowAdapter - card geo from listResults', () => {
+  function nextDataScript(listResults: unknown[]) {
+    const script = document.createElement('script');
+    script.id = '__NEXT_DATA__';
+    script.type = 'application/json';
+    script.textContent = JSON.stringify({
+      props: { pageProps: { searchPageState: { cat1: { searchResults: { listResults } } } } }
+    });
+    return script;
+  }
+
+  beforeEach(() => {
+    setLocation('https://www.zillow.com/shoreline-wa/');
+    document.body.innerHTML =
+      '<article id="zpid_48703301">'
+      + '<a href="/homedetails/1615-N-196th-Pl-Shoreline-WA-98133/48703301_zpid/">x</a>'
+      + '<span data-testid="property-card-price">$774,950</span>'
+      + '</article>';
+  });
+
+  it('reads latLong for the matching zpid', () => {
+    document.body.appendChild(nextDataScript([
+      { zpid: 99999999, latLong: { latitude: 40.0, longitude: -100.0 } },
+      { zpid: 48703301, latLong: { latitude: 47.7715, longitude: -122.3421 } }
+    ]));
+    const card = ZillowAdapter.findCardElements()[0];
+    const h = ZillowAdapter.extractFromCard(card)!;
+    expect(h.latitude).toBeCloseTo(47.7715, 3);
+    expect(h.longitude).toBeCloseTo(-122.3421, 3);
+  });
+
+  it('accepts the lat/lng spelling as well as latitude/longitude', () => {
+    document.body.appendChild(nextDataScript([
+      { zpid: 48703301, latLong: { lat: 47.7715, lng: -122.3421 } }
+    ]));
+    const card = ZillowAdapter.findCardElements()[0];
+    const h = ZillowAdapter.extractFromCard(card)!;
+    expect(h.latitude).toBeCloseTo(47.7715, 3);
+  });
+
+  it('returns null when no record matches this zpid', () => {
+    document.body.appendChild(nextDataScript([
+      { zpid: 11111111, latLong: { latitude: 40.0, longitude: -100.0 } }
+    ]));
+    const card = ZillowAdapter.findCardElements()[0];
+    const h = ZillowAdapter.extractFromCard(card)!;
+    expect(h.latitude).toBeNull();
+    expect(h.longitude).toBeNull();
+  });
+
+  it('returns null on a malformed __NEXT_DATA__ blob without throwing', () => {
+    const script = document.createElement('script');
+    script.id = '__NEXT_DATA__';
+    script.type = 'application/json';
+    script.textContent = '{not json';
+    document.body.appendChild(script);
+    const card = ZillowAdapter.findCardElements()[0];
+    expect(() => ZillowAdapter.extractFromCard(card)).not.toThrow();
+    expect(ZillowAdapter.extractFromCard(card)!.latitude).toBeNull();
+  });
+
+  it('rejects an out-of-range coordinate pair', () => {
+    document.body.appendChild(nextDataScript([
+      { zpid: 48703301, latLong: { latitude: 999, longitude: -122.3421 } }
+    ]));
+    const card = ZillowAdapter.findCardElements()[0];
+    expect(ZillowAdapter.extractFromCard(card)!.latitude).toBeNull();
+  });
+});
+
+describe('ZillowAdapter - map pin projection', () => {
+  /**
+   * jsdom runs no Zillow JS, so nothing lights up a marker on hover by itself. This
+   * fixture wires a plain mouseover/mouseout listener on each card that toggles
+   * `.is-hovered` on its paired marker -- standing in for the real site's own React
+   * handler, so the calibration code under test (event dispatch, marker lookup,
+   * projection fit) is exercised exactly as it runs live. The selectors themselves
+   * (`.zillow-map-layer`, `.is-hovered`) are transcribed from docs/map-linking.md's
+   * live recon, not verified in this suite -- see that doc for the actual page measurements.
+   */
+  function wireCardToMarker(card: Element, marker: Element) {
+    card.addEventListener('mouseover', () => marker.classList.add('is-hovered'));
+    card.addEventListener('mouseout', () => marker.classList.remove('is-hovered'));
+  }
+
+  function nextDataScript(listResults: unknown[]) {
+    const script = document.createElement('script');
+    script.id = '__NEXT_DATA__';
+    script.type = 'application/json';
+    script.textContent = JSON.stringify({
+      props: { pageProps: { searchPageState: { cat1: { searchResults: { listResults } } } } }
+    });
+    return script;
+  }
+
+  function mockRect(el: HTMLElement, rect: { left: number; top: number; width: number; height: number }) {
+    el.getBoundingClientRect = () => ({
+      ...rect, right: rect.left + rect.width, bottom: rect.top + rect.height,
+      x: rect.left, y: rect.top, toJSON() { return this; }
+    });
+  }
+
+  beforeEach(() => {
+    setLocation('https://www.zillow.com/shoreline-wa/');
+    document.body.innerHTML = '';
+
+    const layer = document.createElement('div');
+    layer.className = 'zillow-map-layer';
+    mockRect(layer, { left: 0, top: 0, width: 1000, height: 800 });
+    document.body.appendChild(layer);
+
+    const markerA = document.createElement('div');
+    markerA.className = 'property-marker';
+    mockRect(markerA, { left: 396, top: 296, width: 8, height: 8 });
+    layer.appendChild(markerA);
+
+    const markerB = document.createElement('div');
+    markerB.className = 'property-marker';
+    mockRect(markerB, { left: 596, top: 96, width: 8, height: 8 });
+    layer.appendChild(markerB);
+
+    const cardA = document.createElement('article');
+    cardA.id = 'zpid_1111';
+    cardA.innerHTML = '<a href="/homedetails/a/1111_zpid/">a</a>';
+    document.body.appendChild(cardA);
+
+    const cardB = document.createElement('article');
+    cardB.id = 'zpid_2222';
+    cardB.innerHTML = '<a href="/homedetails/b/2222_zpid/">b</a>';
+    document.body.appendChild(cardB);
+
+    wireCardToMarker(cardA, markerA);
+    wireCardToMarker(cardB, markerB);
+
+    document.body.appendChild(nextDataScript([
+      { zpid: 1111, latLong: { latitude: 30.2672, longitude: -97.7431 } },
+      { zpid: 2222, latLong: { latitude: 30.3072, longitude: -97.7031 } }
+    ]));
+  });
+
+  it('returns null with no map layer on the page', () => {
+    document.querySelector('.zillow-map-layer')!.remove();
+    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+  });
+
+  it('returns null with fewer than two cards carrying known coordinates', () => {
+    document.getElementById('__NEXT_DATA__')!.textContent = JSON.stringify({
+      props: { pageProps: { searchPageState: { cat1: { searchResults: { listResults: [
+        { zpid: 1111, latLong: { latitude: 30.2672, longitude: -97.7431 } }
+      ] } } } } }
+    });
+    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+  });
+
+  it('calibrates from two hover probes and projects a held-out point', () => {
+    const projection = ZillowAdapter.buildMapProjection!();
+    expect(projection).not.toBeNull();
+
+    // A third point, not one of the two calibration anchors -- checks the fit rather
+    // than just echoing an anchor back.
+    const result = ZillowAdapter.projectPoint!(projection, 30.2872, -97.7231)!;
+    expect(result.x).toBeCloseTo(500, 0);
+    expect(result.y).toBeCloseTo(200, 0);
+  });
+
+  it('leaves no marker still hovered after calibration', () => {
+    ZillowAdapter.buildMapProjection!();
+    expect(document.querySelector('.is-hovered')).toBeNull();
+  });
+
+  it('returns null when hovering a card lights up no marker (selector drift)', () => {
+    // A clone carries the same markup but none of the wired listeners, standing in for
+    // hovering doing nothing -- exactly what a changed site class name would look like.
+    const cardA = document.getElementById('zpid_1111')!;
+    cardA.replaceWith(cardA.cloneNode(true));
+    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+  });
+
+  it('projectPoint no-ops to null on a null projection', () => {
+    expect(ZillowAdapter.projectPoint!(null, 30.27, -97.74)).toBeNull();
   });
 });
 

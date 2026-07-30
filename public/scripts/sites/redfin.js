@@ -341,13 +341,81 @@ var RedfinAdapter = (function () {
     detailButtonClassName: 'bp-CalculatorExtension bp-Button--pill',
     detailWrapperClassName: 'HomeControlButtonWrapper',
 
+    /**
+     * The element the site's own map pins live in. Watched by content.js's reposition
+     * observer, and the container our own injected pins get appended into -- Redfin
+     * positions pins with position:absolute; left/top directly inside it (verified live,
+     * docs/map-linking.md §1.1/Option 3), so ours follow the same convention.
+     */
+    mapPinContainer() {
+      return document.querySelector('.HomeMarkersContainer');
+    },
+
+    /**
+     * Fits a lat/lon -> screen-px projection from two of the site's own rendered pins.
+     *
+     * Redfin needs no calibration at all: every pin carries its own latitude/longitude
+     * attributes *and* its own left/top position, so any two pins are enough to fit the
+     * projection directly (verified live: reproduced all 330 on-screen pins to within
+     * 0.001px). Anchors are chosen for maximum spread rather than DOM order, so the fit
+     * isn't destabilized by two near-neighbor pins landing first in the container.
+     *
+     * Returns null -- rather than a broken fit -- when the map isn't on screen yet or
+     * fewer than two pins carry usable geometry; every caller must treat that as "don't
+     * draw anything yet," not an error.
+     */
+    buildMapProjection() {
+      const container = this.mapPinContainer();
+      if (!container) return null;
+
+      const pins = [];
+      for (const el of container.querySelectorAll('.Pushpin[latitude][longitude]')) {
+        const lat = Number(el.getAttribute('latitude'));
+        const lon = Number(el.getAttribute('longitude'));
+        const x = parseFloat(el.style.left);
+        const y = parseFloat(el.style.top);
+        if (Number.isFinite(lat) && Number.isFinite(lon) && Number.isFinite(x) && Number.isFinite(y)) {
+          pins.push({ lat, lon, x, y });
+        }
+      }
+      if (pins.length < 2) return null;
+
+      const spread = (key) => {
+        let min = pins[0], max = pins[0];
+        for (const p of pins) {
+          if (p[key] < min[key]) min = p;
+          if (p[key] > max[key]) max = p;
+        }
+        return [min, max];
+      };
+
+      const [minLon, maxLon] = spread('lon');
+      let fit = SidecarGeoProjection.fit(minLon, maxLon);
+      if (!fit) {
+        // Every pin shares a longitude (a near-vertical view) -- fit off latitude spread
+        // instead of giving up on a projection that a wider pair would have found.
+        const [minLat, maxLat] = spread('lat');
+        fit = SidecarGeoProjection.fit(minLat, maxLat);
+      }
+      if (!fit) return null;
+
+      return { container, fit };
+    },
+
+    /** Projects a (lat, lon) through a projection built by buildMapProjection(). */
+    projectPoint(projection, lat, lon) {
+      return projection ? SidecarGeoProjection.project(projection.fit, lat, lon) : null;
+    },
+
     diagnostics() {
       return {
         cards: document.querySelectorAll('div.bp-Homecard__Content').length,
         detailPage: this.isDetailPage(),
         detailTarget: !!this.detailInjectionTarget(),
         rentalDetailTemplate: !!document.querySelector('.stat-block.price-section'),
-        tableBar: !!document.querySelector('.ActionBar__homeActionButtons.flex')
+        tableBar: !!document.querySelector('.ActionBar__homeActionButtons.flex'),
+        mapPinContainer: !!this.mapPinContainer(),
+        mapProjection: !!this.buildMapProjection()
       };
     }
   };

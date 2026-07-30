@@ -316,6 +316,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     /**
+     * A click on one of our own pins on the site's map (docs/map-linking.md Option 3).
+     * Fire-and-forget, like removeComp: the content script already updated its own DOM,
+     * and there is nothing here to acknowledge -- just a relay to whichever panel is open.
+     */
+    if (request.action === "mapPinClicked") {
+        const { key } = request;
+        if (key) {
+            chrome.runtime.sendMessage({ action: 'highlightHouse', key }, () => {
+                void chrome.runtime.lastError;
+            });
+        }
+    }
+
+    /**
+     * How many of the saved houses with coordinates are currently pinned on the map the
+     * user is looking at, vs. how many have coordinates at all -- the "N of M shown on
+     * this map" the panel surfaces per docs/map-linking.md §5, so a house that's off
+     * viewport (or on a site this feature doesn't cover yet) reads as "not shown", not
+     * as broken. Relayed as-is; nothing here needs to persist it.
+     */
+    if (request.action === "mapPinStatus") {
+        chrome.runtime.sendMessage({
+            action: 'mapPinStatus', shown: request.shown, total: request.total
+        }, () => {
+            void chrome.runtime.lastError;
+        });
+    }
+
+    /**
      * Opens a new tab on the comp-search page for one house and marks it, under a dedicated
      * `compSession` key, as the tab where clicking a result's button means "add as comp" for
      * that house rather than "analyze". One session at a time, matching how a person actually

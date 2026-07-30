@@ -73,6 +73,74 @@ var ZillowAdapter = (function () {
     return walkScoped(data);
   }
 
+  /**
+   * Geo for a results-page card, from the search payload embedded in __NEXT_DATA__.
+   *
+   * A card's own DOM carries no coordinates at all (verified live, docs/map-linking.md
+   * §2) -- unlike the detail page, whose blob is scoped to the one property on screen,
+   * this one lists every result, so it's matched by zpid the same way geoFromNextData
+   * scopes itself. Measured shape (docs/map-linking.md §1.2):
+   * __NEXT_DATA__.props.pageProps.searchPageState.cat1.searchResults.listResults, an
+   * array of records carrying zpid and latLong. mapResults exists on the same payload
+   * but was empty on the page measured, so it isn't used as a source here.
+   */
+  function geoFromListResults(propertyID) {
+    if (!propertyID) return null;
+    const el = document.getElementById('__NEXT_DATA__');
+    if (!el?.textContent) return null;
+
+    let data;
+    try {
+      data = JSON.parse(el.textContent);
+    } catch {
+      return null;
+    }
+
+    const listResults =
+      data?.props?.pageProps?.searchPageState?.cat1?.searchResults?.listResults;
+    if (!Array.isArray(listResults)) return null;
+
+    const record = listResults.find((r) => String(r?.zpid ?? '') === String(propertyID));
+    if (!record) return null;
+
+    // latLong is the shape measured live; lat/lng covers the alternate spelling
+    // Zillow's own API has used elsewhere, so a minor payload drift doesn't silently
+    // regress this back to null.
+    const latitude = Number(record.latLong?.latitude ?? record.latLong?.lat);
+    const longitude = Number(record.latLong?.longitude ?? record.latLong?.lng);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+    if (Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return null;
+    if (latitude === 0 && longitude === 0) return null;
+
+    return { latitude, longitude };
+  }
+
+  /**
+   * Reads back which marker the site lit up in response to a synthetic hover on `card`,
+   * as { lat, lon, x, y } for map-projection calibration -- or null if nothing lit up
+   * (virtualized list, selector drift, or this card's marker isn't in the current view).
+   *
+   * Zillow markers carry no id or coordinates of their own (verified live,
+   * docs/map-linking.md §1.2), so this borrows the site's own card<->pin hover sync to
+   * learn where a *known* coordinate renders on screen. Position is measured relative to
+   * `container`, the same frame our own injected pins are placed in.
+   */
+  function probeMarkerFor(card, geo, container) {
+    card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    const marker = container.querySelector('.is-hovered');
+    card.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+    if (!marker) return null;
+
+    const containerRect = container.getBoundingClientRect();
+    const markerRect = marker.getBoundingClientRect();
+    return {
+      lat: geo.latitude,
+      lon: geo.longitude,
+      x: markerRect.left - containerRect.left + markerRect.width / 2,
+      y: markerRect.top - containerRect.top + markerRect.height / 2
+    };
+  }
+
   /** Price from the RealEstateListing ld+json blob -- the one field it reliably carries. */
   function priceFromLdJson(propertyID) {
     // Scoped to the zpid we're actually capturing, for the same reason geoFromNextData is.
@@ -324,6 +392,7 @@ var ZillowAdapter = (function () {
       // separatedText, not textContent: the card's price element runs straight into its
       // bed count ("$750,0002 bds"), which had every card reporting beds as "0002".
       const facts = P.parseBedBathSqft(P.separatedText(card));
+      const geo = geoFromListResults(propertyID);
 
       return {
         source: 'zillow',
@@ -336,10 +405,12 @@ var ZillowAdapter = (function () {
         sqft: facts.sqft,
         propertyID,
         url: P.absoluteUrl(href, window.location.origin),
-        // Cards don't carry per-listing geo; the rent API degrades without it, and the
-        // panel surfaces that as a rent-estimate error rather than failing the capture.
-        latitude: null,
-        longitude: null,
+        // Falls back to null (rather than throwing) when this card's zpid isn't in the
+        // search payload's listResults -- e.g. mapResults-only pins, which carry no geo
+        // on the page measured (docs/map-linking.md §1.2). The rent API and the map-pin
+        // feature both already degrade gracefully without coordinates.
+        latitude: geo?.latitude ?? null,
+        longitude: geo?.longitude ?? null,
         hoa: null
       };
     },
@@ -371,6 +442,51 @@ var ZillowAdapter = (function () {
     detailButtonClassName: 'bp-CalculatorExtension sidecar-Button--action',
     detailWrapperClassName: 'sidecar-ActionWrapper',
 
+    /** The element the site's own map markers live in (verified live, docs/map-linking.md §1.2). */
+    mapPinContainer() {
+      return document.querySelector('.zillow-map-layer');
+    },
+
+    /**
+     * Fits a lat/lon -> screen-px projection via hover-probe calibration: dispatch a
+     * synthetic hover on two rendered result cards with known coordinates, read back
+     * which marker the site's own JS lit up (`.is-hovered`) and where it landed, and fit
+     * an affine projection from those two (known coordinate, measured position) pairs.
+     * Measured live at 0.00px median error on a cold load (docs/map-linking.md §1.2).
+     *
+     * Deliberately capped at exactly two synthetic hovers per call -- see docs/map-linking.md
+     * §5 on bot-protection posture -- so this fails closed (returns null) rather than
+     * probing further when the list is virtualized down to fewer than two matchable cards,
+     * or when a probe doesn't light up a marker at all.
+     */
+    buildMapProjection() {
+      const container = this.mapPinContainer();
+      if (!container) return null;
+
+      const candidates = [];
+      for (const card of document.querySelectorAll('article[id^="zpid_"]')) {
+        const propertyID = P.zillowPropertyId(P.pathnameOf(cardHref(card), window.location.origin))
+          ?? card.id?.match(/zpid_(\d+)/)?.[1] ?? null;
+        const geo = geoFromListResults(propertyID);
+        if (geo) candidates.push({ card, geo });
+        if (candidates.length >= 2) break;
+      }
+      if (candidates.length < 2) return null;
+
+      const probes = candidates
+        .map(({ card, geo }) => probeMarkerFor(card, geo, container))
+        .filter(Boolean);
+      if (probes.length < 2) return null;
+
+      const fit = SidecarGeoProjection.fit(probes[0], probes[1]);
+      return fit ? { container, fit } : null;
+    },
+
+    /** Projects a (lat, lon) through a projection built by buildMapProjection(). */
+    projectPoint(projection, lat, lon) {
+      return projection ? SidecarGeoProjection.project(projection.fit, lat, lon) : null;
+    },
+
     diagnostics() {
       return {
         cards: document.querySelectorAll('article[id^="zpid_"]').length,
@@ -378,7 +494,19 @@ var ZillowAdapter = (function () {
         detailTarget: !!this.detailInjectionTarget(),
         zpid: P.zillowPropertyId(window.location.pathname),
         hasNextData: !!document.getElementById('__NEXT_DATA__'),
-        ldJsonPrice: priceFromLdJson(P.zillowPropertyId(window.location.pathname))
+        ldJsonPrice: priceFromLdJson(P.zillowPropertyId(window.location.pathname)),
+        listResultsCount: (() => {
+          const el = document.getElementById('__NEXT_DATA__');
+          if (!el?.textContent) return 0;
+          try {
+            const data = JSON.parse(el.textContent);
+            const results = data?.props?.pageProps?.searchPageState?.cat1?.searchResults?.listResults;
+            return Array.isArray(results) ? results.length : 0;
+          } catch {
+            return 0;
+          }
+        })(),
+        mapPinContainer: !!this.mapPinContainer()
       };
     }
   };

@@ -25,6 +25,7 @@
         {
             "js": [
                 "scripts/sites/parsers.js",
+                "scripts/sites/geo-projection.js",
                 "scripts/sites/redfin.js",
                 "scripts/sites/zillow.js",
                 "scripts/sites/homes.js",
