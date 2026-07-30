@@ -31,6 +31,8 @@ interface Driver {
   reconcileMapPins(): void;
   sweepMapPins(): void;
   setShowHousesOnMap(value: boolean): void;
+  setFocusedMapHouseKey(value: string | null): void;
+  setMapVisibility(defaultVisible: boolean, exceptions: string[]): void;
   setStoredHousesForMap(houses: unknown[]): void;
   mapHouseKey(house: unknown): string;
   installMapPinInterceptors(): void;
@@ -78,7 +80,18 @@ function loadDriver(siteStub?: Record<string, unknown>): Driver {
       ensureCalculatorOnCard, actionForListing,
       setCompSession: (s) => { compSession = s; },
       reconcileMapPins, sweepMapPins, mapHouseKey, installMapPinInterceptors,
-      setShowHousesOnMap: (v) => { showHousesOnMap = v; },
+      setShowHousesOnMap: (v) => {
+        mapVisibilityState = { defaultVisible: v, exceptions: new Set() };
+      },
+      setFocusedMapHouseKey: (v) => {
+        mapVisibilityState = {
+          defaultVisible: false,
+          exceptions: new Set(v ? [v] : [])
+        };
+      },
+      setMapVisibility: (defaultVisible, exceptions) => {
+        mapVisibilityState = { defaultVisible, exceptions: new Set(exceptions) };
+      },
       setStoredHousesForMap: (h) => { storedHousesForMap = h; },
       StorageManager, buildComp
     };`
@@ -733,23 +746,27 @@ describe('buildComp respects an adapter-declared id rule', () => {
  * -> message wiring -- none of which depends on which site produced the projection.
  */
 describe('map pins', () => {
-  function mockRect(el: HTMLElement, rect: { width: number; height: number }) {
+  function mockRect(el: HTMLElement, rect: { left?: number; top?: number; width: number; height: number }) {
+    const left = rect.left ?? 0;
+    const top = rect.top ?? 0;
     el.getBoundingClientRect = () => ({
-      left: 0, top: 0, right: rect.width, bottom: rect.height, x: 0, y: 0,
+      left, top, right: left + rect.width, bottom: top + rect.height, x: left, y: top,
       width: rect.width, height: rect.height, toJSON() { return this; }
     });
   }
 
   function mapSite() {
     const container = document.createElement('div');
-    mockRect(container, { width: 1000, height: 800 });
+    mockRect(container, { left: 100, top: 50, width: 1471, height: 0 });
     document.body.appendChild(container);
+    const clip = {
+      left: 100, top: 50, right: 1100, bottom: 850, x: 100, y: 50,
+      width: 1000, height: 800, toJSON() { return this; }
+    };
     return {
       id: 'stub',
       mapPinContainer: () => container,
-      // A trivial 1:1 "projection": lat/lon doubles as x/y, so tests can place a house
-      // in or out of the container's rect just by choosing its coordinates.
-      buildMapProjection: () => ({ container, fit: null }),
+      buildMapProjection: () => ({ container, fit: null, clip, anchor: { dx: 0, dy: 0 } }),
       projectPoint: (_projection: unknown, lat: number, lon: number) => ({ x: lat, y: lon })
     };
   }
@@ -785,6 +802,120 @@ describe('map pins', () => {
 
     const pins = site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]');
     expect(pins).toHaveLength(2);
+    expect(document.getElementById('calculator-styles')).not.toBeNull();
+    expect(getComputedStyle(pins[0]).position).toBe('absolute');
+  });
+
+  it('retries until an asynchronously initialized map projection is ready', () => {
+    vi.useFakeTimers();
+    try {
+      const site = mapSite();
+      const readyProjection = site.buildMapProjection;
+      let ready = false;
+      (site as Record<string, unknown>).buildMapProjection =
+        () => ready ? readyProjection() : null;
+      const d = loadDriver(site);
+      d.setShowHousesOnMap(true);
+      d.setStoredHousesForMap([houseA]);
+
+      d.reconcileMapPins();
+      expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(0);
+
+      ready = true;
+      vi.advanceTimersByTime(150);
+      expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps retrying when an early projection cannot place a visible candidate', () => {
+    vi.useFakeTimers();
+    try {
+      const site = mapSite();
+      let settled = false;
+      site.projectPoint = (_projection: unknown, lat: number, lon: number) =>
+        settled ? { x: lat, y: lon } : { x: 5000, y: 5000 };
+      const d = loadDriver(site);
+      d.setShowHousesOnMap(true);
+      d.setStoredHousesForMap([houseA]);
+
+      d.reconcileMapPins();
+      expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(0);
+
+      settled = true;
+      vi.advanceTimersByTime(150);
+      expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows only the individually focused house while show-all is off', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(false);
+    d.setFocusedMapHouseKey(d.mapHouseKey(houseB));
+    d.setStoredHousesForMap([houseA, houseB]);
+    d.reconcileMapPins();
+
+    const pins = site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]');
+    expect(pins).toHaveLength(1);
+    expect((pins[0] as HTMLElement).dataset.sidecarHouseKey).toBe(d.mapHouseKey(houseB));
+  });
+
+  it('treats individual keys as exceptions to the global default', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setStoredHousesForMap([houseA, houseB]);
+    d.setMapVisibility(true, [d.mapHouseKey(houseA)]);
+    d.reconcileMapPins();
+
+    const pins = site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]');
+    expect(pins).toHaveLength(1);
+    expect((pins[0] as HTMLElement).dataset.sidecarHouseKey).toBe(d.mapHouseKey(houseB));
+  });
+
+  it('uses the explicit clip when the marker container has zero height', () => {
+    const site = mapSite();
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([{ ...houseA, latitude: 400, longitude: 300 }]);
+    d.reconcileMapPins();
+
+    expect(site.mapPinContainer().querySelectorAll('[data-sidecar-pin="1"]')).toHaveLength(1);
+  });
+
+  it('applies the adapter anchor to pin coordinates', () => {
+    const site = mapSite();
+    const originalBuild = site.buildMapProjection;
+    site.buildMapProjection = () => ({ ...originalBuild(), anchor: { dx: 6, dy: 6 } });
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+
+    const pin = site.mapPinContainer().querySelector('[data-sidecar-pin="1"]') as HTMLElement;
+    expect(pin.style.left).toBe('106px');
+    expect(pin.style.top).toBe('106px');
+  });
+
+  it('positions pins relative to a separate map host when the native marker pane cannot render children', () => {
+    const site = mapSite();
+    const host = document.createElement('div');
+    mockRect(host, { left: 100, top: 50, width: 1000, height: 800 });
+    document.body.appendChild(host);
+    const originalBuild = site.buildMapProjection;
+    site.buildMapProjection = () => ({ ...originalBuild(), host });
+    const d = loadDriver(site);
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+
+    const pin = host.querySelector('[data-sidecar-pin="1"]') as HTMLElement;
+    expect(pin).not.toBeNull();
+    expect(pin.style.left).toBe('100px');
+    expect(pin.style.top).toBe('100px');
   });
 
   it('skips a house with no coordinates', () => {
@@ -890,5 +1021,27 @@ describe('map pins', () => {
 
     expect(event.defaultPrevented).toBe(false);
     expect(d.sendMessageCalls.find((m) => m.action === 'mapPinClicked')).toBeUndefined();
+  });
+
+  it('relays a tagged native pin click without blocking the site click', () => {
+    const site = mapSite();
+    const nativePin = document.createElement('button');
+    site.mapPinContainer().appendChild(nativePin);
+    Object.assign(site, {
+      nativeMapPinForHouse: () => nativePin
+    });
+    const d = loadDriver(site);
+    d.installMapPinInterceptors();
+    d.setShowHousesOnMap(true);
+    d.setStoredHousesForMap([houseA]);
+    d.reconcileMapPins();
+
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+    nativePin.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(nativePin.dataset.sidecarHouseKey).toBe(d.mapHouseKey(houseA));
+    expect(d.sendMessageCalls.find((m) => m.action === 'mapPinClicked'))
+      .toMatchObject({ key: d.mapHouseKey(houseA) });
   });
 });

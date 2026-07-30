@@ -115,30 +115,110 @@ var ZillowAdapter = (function () {
     return { latitude, longitude };
   }
 
-  /**
-   * Reads back which marker the site lit up in response to a synthetic hover on `card`,
-   * as { lat, lon, x, y } for map-projection calibration -- or null if nothing lit up
-   * (virtualized list, selector drift, or this card's marker isn't in the current view).
-   *
-   * Zillow markers carry no id or coordinates of their own (verified live,
-   * docs/map-linking.md §1.2), so this borrows the site's own card<->pin hover sync to
-   * learn where a *known* coordinate renders on screen. Position is measured relative to
-   * `container`, the same frame our own injected pins are placed in.
-   */
-  function probeMarkerFor(card, geo, container) {
-    card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    const marker = container.querySelector('.is-hovered');
-    card.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
-    if (!marker) return null;
+  function mapBoundsFromUrl() {
+    let raw;
+    try {
+      raw = new URL(window.location.href).searchParams.get('searchQueryState');
+    } catch {
+      return null;
+    }
+    if (!raw) return null;
 
+    let bounds;
+    try {
+      bounds = JSON.parse(raw)?.mapBounds;
+    } catch {
+      return null;
+    }
+    const north = Number(bounds?.north);
+    const south = Number(bounds?.south);
+    const east = Number(bounds?.east);
+    const west = Number(bounds?.west);
+    if (![north, south, east, west].every(Number.isFinite)) return null;
+    if (north === south || east === west) return null;
+    if (Math.abs(north) > 90 || Math.abs(south) > 90
+        || Math.abs(east) > 180 || Math.abs(west) > 180) return null;
+    return { north, south, east, west };
+  }
+
+  let coldProjection = null;
+  let coldProjectionContainer = null;
+  let coldProjectionPath = null;
+  let coldProbePromise = null;
+  let coldProbeAttempted = false;
+
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function probeMarkerFor(card, geo, container) {
+    const alreadyHovered = new Set(container.querySelectorAll('.is-hovered'));
+    card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    await wait(150);
+    const hovered = [...container.querySelectorAll('.is-hovered')]
+      .find((el) => !alreadyHovered.has(el));
     const containerRect = container.getBoundingClientRect();
-    const markerRect = marker.getBoundingClientRect();
+    const markerRect = hovered?.getBoundingClientRect();
+    card.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+    if (!markerRect) return null;
     return {
       lat: geo.latitude,
       lon: geo.longitude,
       x: markerRect.left - containerRect.left + markerRect.width / 2,
       y: markerRect.top - containerRect.top + markerRect.height / 2
     };
+  }
+
+  function startColdProjectionProbe(container) {
+    const path = window.location.pathname;
+    if (coldProjectionContainer !== container || coldProjectionPath !== path) {
+      coldProjection = null;
+      coldProjectionContainer = container;
+      coldProjectionPath = path;
+      coldProbePromise = null;
+      coldProbeAttempted = false;
+    }
+    if (coldProjection || coldProbePromise || coldProbeAttempted) return;
+    if (document.visibilityState === 'hidden'
+        || !container.querySelector('.streamlined-marker-container')) return;
+
+    const candidates = [];
+    for (const card of document.querySelectorAll('article[id^="zpid_"]')) {
+      const propertyID = P.zillowPropertyId(P.pathnameOf(cardHref(card), window.location.origin))
+        ?? card.id?.match(/zpid_(\d+)/)?.[1] ?? null;
+      const geo = geoFromListResults(propertyID);
+      if (geo) candidates.push({ card, geo });
+    }
+    if (candidates.length < 2) return;
+
+    let pair = [candidates[0], candidates[1]];
+    let spread = -1;
+    for (let i = 0; i < candidates.length - 1; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const distance = Math.hypot(
+          candidates[i].geo.latitude - candidates[j].geo.latitude,
+          candidates[i].geo.longitude - candidates[j].geo.longitude
+        );
+        if (distance > spread) {
+          spread = distance;
+          pair = [candidates[i], candidates[j]];
+        }
+      }
+    }
+
+    coldProbeAttempted = true;
+    coldProbePromise = (async () => {
+      const probes = [];
+      for (const candidate of pair) {
+        const probe = await probeMarkerFor(candidate.card, candidate.geo, container);
+        if (probe) probes.push(probe);
+      }
+      if (probes.length === 2
+          && coldProjectionContainer === container
+          && coldProjectionPath === path) {
+        coldProjection = SidecarGeoProjection.fit(probes[0], probes[1]);
+      }
+    })().finally(() => {
+      coldProbePromise = null;
+    });
   }
 
   /** Price from the RealEstateListing ld+json blob -- the one field it reliably carries. */
@@ -444,44 +524,44 @@ var ZillowAdapter = (function () {
     detailButtonClassName: 'bp-CalculatorExtension sidecar-Button--action',
     detailWrapperClassName: 'sidecar-ActionWrapper',
 
-    /** The element the site's own map markers live in (verified live, docs/map-linking.md §1.2). */
     mapPinContainer() {
-      return document.querySelector('.zillow-map-layer');
+      const layers = document.querySelectorAll('.zillow-map-layer');
+      for (const layer of layers) {
+        if (layer.querySelector('.streamlined-marker-container')) return layer;
+      }
+      return layers[0] ?? null;
     },
 
-    /**
-     * Fits a lat/lon -> screen-px projection via hover-probe calibration: dispatch a
-     * synthetic hover on two rendered result cards with known coordinates, read back
-     * which marker the site's own JS lit up (`.is-hovered`) and where it landed, and fit
-     * an affine projection from those two (known coordinate, measured position) pairs.
-     * Measured live at 0.00px median error on a cold load (docs/map-linking.md §1.2).
-     *
-     * Deliberately capped at exactly two synthetic hovers per call -- see docs/map-linking.md
-     * §5 on bot-protection posture -- so this fails closed (returns null) rather than
-     * probing further when the list is virtualized down to fewer than two matchable cards,
-     * or when a probe doesn't light up a marker at all.
-     */
+    mapClipElement() {
+      return document.querySelector('#search-page-map');
+    },
+
+    mapPinAnchorOffset() {
+      return { dx: 0, dy: 0 };
+    },
+
     buildMapProjection() {
       const container = this.mapPinContainer();
-      if (!container) return null;
+      const clipEl = this.mapClipElement();
+      const bounds = mapBoundsFromUrl();
+      if (!container || !clipEl) return null;
 
-      const candidates = [];
-      for (const card of document.querySelectorAll('article[id^="zpid_"]')) {
-        const propertyID = P.zillowPropertyId(P.pathnameOf(cardHref(card), window.location.origin))
-          ?? card.id?.match(/zpid_(\d+)/)?.[1] ?? null;
-        const geo = geoFromListResults(propertyID);
-        if (geo) candidates.push({ card, geo });
-        if (candidates.length >= 2) break;
+      const clip = clipEl.getBoundingClientRect();
+      if (!clip.width || !clip.height) return null;
+      if (!bounds) {
+        startColdProjectionProbe(container);
+        return coldProjection
+          ? { container, fit: coldProjection, clip, anchor: this.mapPinAnchorOffset() }
+          : null;
       }
-      if (candidates.length < 2) return null;
-
-      const probes = candidates
-        .map(({ card, geo }) => probeMarkerFor(card, geo, container))
-        .filter(Boolean);
-      if (probes.length < 2) return null;
-
-      const fit = SidecarGeoProjection.fit(probes[0], probes[1]);
-      return fit ? { container, fit } : null;
+      const origin = container.getBoundingClientRect();
+      const fit = SidecarGeoProjection.fit(
+        { lat: bounds.north, lon: bounds.west, x: clip.left - origin.left, y: clip.top - origin.top },
+        { lat: bounds.south, lon: bounds.east, x: clip.right - origin.left, y: clip.bottom - origin.top }
+      );
+      return fit
+        ? { container, fit, clip, anchor: this.mapPinAnchorOffset() }
+        : null;
     },
 
     /** Projects a (lat, lon) through a projection built by buildMapProjection(). */

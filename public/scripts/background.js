@@ -6,6 +6,34 @@ import {
 import { buildCompUrl } from './comp-links.js';
 
 const COMP_SESSION_STALE_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_MAP_VISIBILITY = { defaultVisible: false, exceptions: [] };
+
+function normalizeMapVisibility(value, legacyDefault = false) {
+    const defaultVisible = typeof value?.defaultVisible === 'boolean'
+        ? value.defaultVisible
+        : Boolean(legacyDefault);
+    const exceptions = Array.isArray(value?.exceptions)
+        ? [...new Set(value.exceptions.filter((key) => typeof key === 'string'))]
+        : [];
+    return { defaultVisible, exceptions };
+}
+
+let mapVisibilityQueue = Promise.resolve();
+
+function mutateMapVisibility(mutator) {
+    const run = async () => {
+        const stored = await chrome.storage.local.get(['mapVisibility', 'showHousesOnMap']);
+        const current = normalizeMapVisibility(stored.mapVisibility, stored.showHousesOnMap);
+        const next = normalizeMapVisibility(mutator(current));
+        await chrome.storage.local.set({ mapVisibility: next });
+        chrome.runtime.sendMessage({ action: 'mapVisibilityUpdated', state: next }, () => {
+            void chrome.runtime.lastError;
+        });
+        return next;
+    };
+    mapVisibilityQueue = mapVisibilityQueue.then(run, run);
+    return mapVisibilityQueue;
+}
 
 function notifySidePanel(houses, undoLog) {
     chrome.runtime.sendMessage({
@@ -71,15 +99,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             try {
                 const key = houseKey(request.house);
                 let alreadyTracked = false;
+                let enriched = false;
 
                 await mutateStoredHouses((storedHouses) => {
-                    alreadyTracked = storedHouses.some((house) => houseKey(house) === key);
-                    if (alreadyTracked) return null;
+                    const index = storedHouses.findIndex((house) => houseKey(house) === key);
+                    alreadyTracked = index !== -1;
+                    if (alreadyTracked) {
+                        const current = storedHouses[index];
+                        const incomingLatitude = Number(request.house.latitude);
+                        const incomingLongitude = Number(request.house.longitude);
+                        const needsCoordinates = !Number.isFinite(current.latitude)
+                            || !Number.isFinite(current.longitude);
+                        const hasCoordinates = Number.isFinite(incomingLatitude)
+                            && Number.isFinite(incomingLongitude);
+                        if (!needsCoordinates || !hasCoordinates) return null;
+
+                        const updated = [...storedHouses];
+                        updated[index] = stampRevision({
+                            ...current,
+                            latitude: incomingLatitude,
+                            longitude: incomingLongitude
+                        }, 'capture-geo');
+                        enriched = true;
+                        return updated;
+                    }
                     console.log(`House added: ${key}`);
                     return [...storedHouses, stampRevision(request.house, 'capture')];
                 });
 
-                sendResponse({ ok: true, added: !alreadyTracked });
+                sendResponse({ ok: true, added: !alreadyTracked, enriched });
             } catch (error) {
                 sendResponse({
                     ok: false,
@@ -226,11 +274,60 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.action === "mapPinStatus") {
-        chrome.runtime.sendMessage({
-            action: 'mapPinStatus', shown: request.shown, total: request.total
-        }, () => {
-            void chrome.runtime.lastError;
+        if (sender.tab?.active) {
+            chrome.runtime.sendMessage({
+                action: 'mapPinStatus',
+                shown: request.shown,
+                total: request.total,
+                missing: request.missing,
+                tabId: sender.tab.id
+            }, () => {
+                void chrome.runtime.lastError;
+            });
+        }
+    }
+
+    if (request.action === "highlightMapHouse" || request.action === "focusMapHouse") {
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            const tabId = tabs?.[0]?.id;
+            if (!tabId) return;
+            chrome.tabs.sendMessage(tabId, {
+                action: request.action,
+                key: typeof request.key === 'string' ? request.key : null
+            }, () => { void chrome.runtime.lastError; });
         });
+    }
+
+    if (request.action === "setMapDefault") {
+        (async () => {
+            const next = await mutateMapVisibility(() => ({
+                defaultVisible: Boolean(request.visible),
+                exceptions: []
+            }));
+            sendResponse({ ok: true, state: next });
+        })().catch((error) => {
+            sendResponse({ ok: false, reason: error instanceof Error ? error.message : 'Chrome storage failed' });
+        });
+        return true;
+    }
+
+    if (request.action === "toggleMapHouse") {
+        (async () => {
+            if (typeof request.key !== 'string') {
+                sendResponse({ ok: false, reason: 'Invalid house key.' });
+                return;
+            }
+            const next = await mutateMapVisibility((current) => {
+                const exceptions = new Set(current.exceptions);
+                if (exceptions.has(request.key)) exceptions.delete(request.key);
+                else exceptions.add(request.key);
+                return { ...current, exceptions: [...exceptions] };
+            });
+            sendResponse({ ok: true, state: next });
+        })().catch((error) => {
+            sendResponse({ ok: false, reason: error instanceof Error ? error.message : 'Chrome storage failed' });
+        });
+        return true;
     }
 
     if (request.action === "startCompSession") {

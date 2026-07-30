@@ -1,0 +1,686 @@
+diff --git a/public/scripts/content.js b/public/scripts/content.js
+index e432e7f..a125a86 100644
+--- a/public/scripts/content.js
++++ b/public/scripts/content.js
+@@ -6,7 +6,7 @@
+ const LOG_PREFIX = '[Investor Sidecar]';
+ const OBSERVER_OPTIONS = { childList: true, subtree: true };
+ /** Bump when shipping a change that needs to be confirmed as loaded in the browser. */
+-const SIDECAR_BUILD = '2026-07-29.1';
++const SIDECAR_BUILD = '2026-07-30.crossmap';
+ 
+ const ADAPTERS = [RedfinAdapter, ZillowAdapter, HomesAdapter];
+ const site = ADAPTERS.find(a => a.matchesHost(window.location.hostname)) ?? null;
+@@ -1025,14 +1025,30 @@ function reconcileMapPins() {
+   }
+ 
+   const container = projection.container;
+-  const rect = container.getBoundingClientRect();
+   const margin = 24;
+ 
++  // Membership is decided in *screen* space, against the element that actually bounds the
++  // visible map (projection.clip) -- never against the container's own width/height. The
++  // container is a coordinate-space origin, not a viewport: on Redfin it measures 1471x0,
++  // so testing `point.y > rect.height` accepted only y in [-24, 24] and silently dropped
++  // ~94% of houses, which is what produced "0 of N shown". Only origin.left/top are
++  // meaningful here. See docs/map-pin-implementation-spec.md.
++  const origin = container.getBoundingClientRect();
++  const clip = projection.clip || origin;
++  const anchor = projection.anchor || { dx: 0, dy: 0 };
++
+   const placed = new Map();
+   for (const house of candidates) {
+-    const point = site.projectPoint(projection, house.latitude, house.longitude);
+-    if (!point) continue;
+-    if (point.x < -margin || point.x > rect.width + margin || point.y < -margin || point.y > rect.height + margin) {
++    const projected = site.projectPoint(projection, house.latitude, house.longitude);
++    if (!projected) continue;
++
++    // The projection is fitted from the site's own pin coordinates, which may denote a
++    // corner rather than the geographic point; anchor shifts us onto the real point.
++    const point = { x: projected.x + anchor.dx, y: projected.y + anchor.dy };
++    const screenX = origin.left + point.x;
++    const screenY = origin.top + point.y;
++    if (screenX < clip.left - margin || screenX > clip.right + margin ||
++        screenY < clip.top - margin || screenY > clip.bottom + margin) {
+       continue;
+     }
+     placed.set(mapHouseKey(house), { house, point });
+diff --git a/public/scripts/sites/homes.js b/public/scripts/sites/homes.js
+index 806bbde..915f2ef 100644
+--- a/public/scripts/sites/homes.js
++++ b/public/scripts/sites/homes.js
+@@ -457,6 +457,103 @@ var HomesAdapter = (function () {
+     detailButtonClassName: 'bp-CalculatorExtension sidecar-Button--action',
+     detailWrapperClassName: 'sidecar-ActionWrapper',
+ 
++    /**
++     * Map pins on Homes.com. All three sites are Google Maps, but Homes.com uses Advanced
++     * Markers (`<gmp-advanced-marker>`), which differ from Redfin's plain pins in two ways:
++     * they carry their coordinates in a `position="lat,lon"` attribute rather than separate
++     * `latitude`/`longitude` attributes, and they are positioned by a transform translate
++     * rather than `style.left/top`. Measured live: 609 markers, projection fit accurate to
++     * 0.935px worst case (the residual is Google rounding translates to half-pixels).
++     */
++    mapPinContainer() {
++      // The container is an unclassed div; the markers' own parent is the only stable
++      // handle on it, and it is the coordinate space they are positioned within.
++      return document.querySelector('gmp-advanced-marker')?.parentElement ?? null;
++    },
++
++    /**
++     * The element that actually bounds the visible map. Not mapPinContainer(): that
++     * measures `574 x 0` (measured live) -- an origin point, not a viewport.
++     */
++    mapClipElement() {
++      return document.querySelector('#map.search-map-container')
++        ?? document.querySelector('.search-map-container');
++    },
++
++    /**
++     * Advanced Markers are 29x40 and anchored bottom-centre, and the translate we fit
++     * against is the element's top-left, so the geographic point sits 14.5px right and
++     * 40px down from it.
++     */
++    mapPinAnchorOffset() {
++      return { dx: 14.5, dy: 40 };
++    },
++
++    /** Reads a marker's own (lat, lon) and its position within the container. */
++    _markerPoints() {
++      const container = this.mapPinContainer();
++      if (!container) return [];
++      const points = [];
++      for (const el of container.querySelectorAll('gmp-advanced-marker[position]')) {
++        const parts = (el.getAttribute('position') || '').split(',');
++        const lat = Number(parts[0]);
++        const lon = Number(parts[1]);
++        const m = getComputedStyle(el).transform.match(/matrix\(([^)]+)\)/);
++        if (!m || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
++        const parsed = m[1].split(',').map(Number);
++        const x = parsed[4];
++        const y = parsed[5];
++        if (Number.isFinite(x) && Number.isFinite(y)) points.push({ lat, lon, x, y });
++      }
++      return points;
++    },
++
++    /**
++     * Fits a lat/lon -> container-px projection from two of the site's own markers, chosen
++     * for maximum spread so the fit isn't destabilised by two near-neighbours. Returns null
++     * -- never a broken fit -- when the map isn't rendered yet or fewer than two markers
++     * carry usable geometry; callers must treat that as "don't draw anything yet".
++     */
++    buildMapProjection() {
++      const container = this.mapPinContainer();
++      if (!container) return null;
++
++      const points = this._markerPoints();
++      if (points.length < 2) return null;
++
++      const spread = (key) => {
++        let min = points[0], max = points[0];
++        for (const p of points) {
++          if (p[key] < min[key]) min = p;
++          if (p[key] > max[key]) max = p;
++        }
++        return [min, max];
++      };
++
++      const [minLon, maxLon] = spread('lon');
++      let fit = SidecarGeoProjection.fit(minLon, maxLon);
++      if (!fit) {
++        // Every marker shares a longitude (a near-vertical view) -- fit off latitude
++        // spread instead of giving up on a projection a wider pair would have found.
++        const [minLat, maxLat] = spread('lat');
++        fit = SidecarGeoProjection.fit(minLat, maxLat);
++      }
++      if (!fit) return null;
++
++      const clipEl = this.mapClipElement();
++      return {
++        container,
++        fit,
++        clip: clipEl ? clipEl.getBoundingClientRect() : null,
++        anchor: this.mapPinAnchorOffset()
++      };
++    },
++
++    /** Projects a (lat, lon) through a projection built by buildMapProjection(). */
++    projectPoint(projection, lat, lon) {
++      return projection ? SidecarGeoProjection.project(projection.fit, lat, lon) : null;
++    },
++
+     diagnostics() {
+       const pk = homesPropertyId(window.location.pathname);
+       return {
+diff --git a/public/scripts/sites/redfin.js b/public/scripts/sites/redfin.js
+index 34a5c0f..3059031 100644
+--- a/public/scripts/sites/redfin.js
++++ b/public/scripts/sites/redfin.js
+@@ -351,6 +351,29 @@ var RedfinAdapter = (function () {
+       return document.querySelector('.HomeMarkersContainer');
+     },
+ 
++    /**
++     * The element that actually bounds the visible map, for clipping decisions.
++     *
++     * Emphatically NOT mapPinContainer(): `.HomeMarkersContainer` is `position: static`
++     * with a measured rect of `1471 x 0` -- an origin *point* for the marker coordinate
++     * space, not a box. Redfin's real clip is the Google Maps wrapper, which is the
++     * element carrying `overflow: hidden`.
++     */
++    mapClipElement() {
++      return document.querySelector('#search-map-wrapper');
++    },
++
++    /**
++     * Offset from a projected point to the true geographic point, in container pixels.
++     * The projection is fitted from native pins' `style.left/top`, which is the element's
++     * top-left corner (measured live: `margin: 0`, `transform: none`, rendered position
++     * exactly `origin + left/top`). Redfin's plain markers are 12x12, so the geographic
++     * point sits 6px right and 6px down from that corner.
++     */
++    mapPinAnchorOffset() {
++      return { dx: 6, dy: 6 };
++    },
++
+     /**
+      * Fits a lat/lon -> screen-px projection from two of the site's own rendered pins.
+      *
+@@ -399,7 +422,13 @@ var RedfinAdapter = (function () {
+       }
+       if (!fit) return null;
+ 
+-      return { container, fit };
++      const clipEl = this.mapClipElement();
++      return {
++        container,
++        fit,
++        clip: clipEl ? clipEl.getBoundingClientRect() : null,
++        anchor: this.mapPinAnchorOffset()
++      };
+     },
+ 
+     /** Projects a (lat, lon) through a projection built by buildMapProjection(). */
+diff --git a/public/scripts/sites/zillow.js b/public/scripts/sites/zillow.js
+index ccca13b..aa74176 100644
+--- a/public/scripts/sites/zillow.js
++++ b/public/scripts/sites/zillow.js
+@@ -125,20 +125,36 @@ var ZillowAdapter = (function () {
+    * learn where a *known* coordinate renders on screen. Position is measured relative to
+    * `container`, the same frame our own injected pins are placed in.
+    */
+-  function probeMarkerFor(card, geo, container) {
+-    card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+-    const marker = container.querySelector('.is-hovered');
+-    card.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+-    if (!marker) return null;
+-
+-    const containerRect = container.getBoundingClientRect();
+-    const markerRect = marker.getBoundingClientRect();
+-    return {
+-      lat: geo.latitude,
+-      lon: geo.longitude,
+-      x: markerRect.left - containerRect.left + markerRect.width / 2,
+-      y: markerRect.top - containerRect.top + markerRect.height / 2
+-    };
++  function mapBoundsFromUrl() {
++    let raw;
++    try {
++      // Parsed off href rather than location.search: href is the one part of location that
++      // is always populated, in the browser and under test alike.
++      raw = new URL(window.location.href).searchParams.get('searchQueryState');
++    } catch {
++      return null;
++    }
++    if (!raw) return null;
++
++    let bounds;
++    try {
++      bounds = JSON.parse(raw)?.mapBounds;
++    } catch {
++      return null; // a malformed state shouldn't throw out of a reconcile
++    }
++
++    const north = Number(bounds?.north);
++    const south = Number(bounds?.south);
++    const east = Number(bounds?.east);
++    const west = Number(bounds?.west);
++    if (![north, south, east, west].every(Number.isFinite)) return null;
++    // Degenerate or placeholder bounds. Zillow's __NEXT_DATA__ copy of this state is all
++    // zeros on a cold load (verified live), and the same shape can reach the URL; an
++    // all-zero box would otherwise fit a projection that silently places every pin wrongly.
++    if (north === south || east === west) return null;
++    if (Math.abs(north) > 90 || Math.abs(south) > 90) return null;
++    if (Math.abs(east) > 180 || Math.abs(west) > 180) return null;
++    return { north, south, east, west };
+   }
+ 
+   /** Price from the RealEstateListing ld+json blob -- the one field it reliably carries. */
+@@ -444,44 +460,85 @@ var ZillowAdapter = (function () {
+     detailButtonClassName: 'bp-CalculatorExtension sidecar-Button--action',
+     detailWrapperClassName: 'sidecar-ActionWrapper',
+ 
+-    /** The element the site's own map markers live in (verified live, docs/map-linking.md §1.2). */
++    /**
++     * The element the site's own map markers live in.
++     *
++     * Zillow renders **two** `.zillow-map-layer` elements, and `querySelector` returns the
++     * wrong one: measured live, index 0 holds zero markers while index 1 holds all 501. The
++     * previous implementation took the first, which meant calibration searched a
++     * marker-less subtree and our pins would have been appended to a container the map
++     * never transforms. Select by content, not by document order.
++     */
+     mapPinContainer() {
+-      return document.querySelector('.zillow-map-layer');
++      const layers = document.querySelectorAll('.zillow-map-layer');
++      for (const layer of layers) {
++        if (layer.querySelector('.streamlined-marker-container')) return layer;
++      }
++      return layers[0] ?? null;
+     },
+ 
+     /**
+-     * Fits a lat/lon -> screen-px projection via hover-probe calibration: dispatch a
+-     * synthetic hover on two rendered result cards with known coordinates, read back
+-     * which marker the site's own JS lit up (`.is-hovered`) and where it landed, and fit
+-     * an affine projection from those two (known coordinate, measured position) pairs.
+-     * Measured live at 0.00px median error on a cold load (docs/map-linking.md §1.2).
++     * The element that actually bounds the visible map, for clipping decisions.
+      *
+-     * Deliberately capped at exactly two synthetic hovers per call -- see docs/map-linking.md
+-     * §5 on bot-protection posture -- so this fails closed (returns null) rather than
+-     * probing further when the list is virtualized down to fewer than two matchable cards,
+-     * or when a probe doesn't light up a marker at all.
++     * Must not be mapPinContainer(): `.zillow-map-layer` measures `0 x 0` (measured live) --
++     * it's the marker coordinate-space origin, not a viewport. Without this method the
++     * driver falls back to that zero-size rect and drops nearly every house, which is the
++     * same defect that made Redfin show "0 of N". See docs/map-pin-implementation-spec.md.
++     */
++    mapClipElement() {
++      return document.querySelector('#search-page-map');
++    },
++
++    /**
++     * Zero, unlike Redfin's. The bounds fit below is derived from the map's own geographic
++     * edges rather than from a marker's top-left corner, so it already yields the true
++     * geographic point -- there is no marker-corner bias to correct. Confirmed live: pins
++     * placed with no offset landed a median 0.4px from the native markers' centres.
++     */
++    mapPinAnchorOffset() {
++      return { dx: 0, dy: 0 };
++    },
++
++    /**
++     * Fits a lat/lon -> container-px projection from the map's own geographic bounds.
++     *
++     * Replaces the previous hover-probe calibration, which dispatched two synthetic hovers
++     * on result cards and read back which marker gained `.is-hovered`. That approach was
++     * broken twice over, both confirmed live: it searched the wrong `.zillow-map-layer`
++     * (see mapPinContainer), and it queried for `.is-hovered` *synchronously* after
++     * dispatching, while Zillow's own handler only applies the class on a later tick --
++     * measured 0 matches synchronously, 1 match after 150ms. So it always returned null.
++     *
++     * The bounds in the URL's `searchQueryState` describe exactly the rendered viewport, so
++     * two corners of the map pane are two reference points, and no interaction is needed at
++     * all. This is both more reliable and strictly better for the bot-protection posture
++     * (docs/map-linking.md §5): zero synthetic events. Validated live against 40 listings
++     * with known coordinates at 0.4px median / 0.8px max error.
++     *
++     * Fails closed (null) when the URL carries no bounds yet -- true on a cold landing
++     * before the map settles. Never fall back to probing; the next reconcile will pick it up.
+      */
+     buildMapProjection() {
+       const container = this.mapPinContainer();
+-      if (!container) return null;
+-
+-      const candidates = [];
+-      for (const card of document.querySelectorAll('article[id^="zpid_"]')) {
+-        const propertyID = P.zillowPropertyId(P.pathnameOf(cardHref(card), window.location.origin))
+-          ?? card.id?.match(/zpid_(\d+)/)?.[1] ?? null;
+-        const geo = geoFromListResults(propertyID);
+-        if (geo) candidates.push({ card, geo });
+-        if (candidates.length >= 2) break;
+-      }
+-      if (candidates.length < 2) return null;
++      const clipEl = this.mapClipElement();
++      if (!container || !clipEl) return null;
++
++      const bounds = mapBoundsFromUrl();
++      if (!bounds) return null;
++
++      const clip = clipEl.getBoundingClientRect();
++      if (!clip.width || !clip.height) return null;
+ 
+-      const probes = candidates
+-        .map(({ card, geo }) => probeMarkerFor(card, geo, container))
+-        .filter(Boolean);
+-      if (probes.length < 2) return null;
++      // Reference points in the same frame our pins are placed in: the pane's NW and SE
++      // corners, whose coordinates are the bounds' corners.
++      const origin = container.getBoundingClientRect();
++      const fit = SidecarGeoProjection.fit(
++        { lat: bounds.north, lon: bounds.west, x: clip.left - origin.left, y: clip.top - origin.top },
++        { lat: bounds.south, lon: bounds.east, x: clip.right - origin.left, y: clip.bottom - origin.top }
++      );
++      if (!fit) return null;
+ 
+-      const fit = SidecarGeoProjection.fit(probes[0], probes[1]);
+-      return fit ? { container, fit } : null;
++      return { container, fit, clip, anchor: this.mapPinAnchorOffset() };
+     },
+ 
+     /** Projects a (lat, lon) through a projection built by buildMapProjection(). */
+diff --git a/test/site-adapters.test.ts b/test/site-adapters.test.ts
+index e8aa570..e1c4a22 100644
+--- a/test/site-adapters.test.ts
++++ b/test/site-adapters.test.ts
+@@ -62,7 +62,14 @@ interface SiteAdapter {
+   isRentalDetailPage?(): boolean;
+   listingStatusFromCard?(el: Element): string | null;
+   mapPinContainer?(): Element | null;
+-  buildMapProjection?(): { container: Element; fit: unknown } | null;
++  buildMapProjection?(): {
++    container: Element;
++    fit: unknown;
++    clip?: DOMRect | null;
++    anchor?: { dx: number; dy: number };
++  } | null;
++  mapClipElement?(): Element | null;
++  mapPinAnchorOffset?(): { dx: number; dy: number };
+   projectPoint?(projection: unknown, lat: number, lon: number): { x: number; y: number } | null;
+ }
+ 
+@@ -74,7 +81,12 @@ function setLocation(href: string) {
+   const url = new URL(href);
+   Object.defineProperty(window, 'location', {
+     configurable: true,
+-    value: { ...window.location, href, hostname: url.hostname, pathname: url.pathname, origin: url.origin }
++    // search included deliberately: without it, code reading location.search saw the
++    // previous test's query string, which silently made URL-derived state untestable.
++    value: {
++      ...window.location, href, hostname: url.hostname, pathname: url.pathname,
++      origin: url.origin, search: url.search
++    }
+   });
+ }
+ 
+@@ -913,29 +925,13 @@ describe('ZillowAdapter - card geo from listResults', () => {
+ 
+ describe('ZillowAdapter - map pin projection', () => {
+   /**
+-   * jsdom runs no Zillow JS, so nothing lights up a marker on hover by itself. This
+-   * fixture wires a plain mouseover/mouseout listener on each card that toggles
+-   * `.is-hovered` on its paired marker -- standing in for the real site's own React
+-   * handler, so the calibration code under test (event dispatch, marker lookup,
+-   * projection fit) is exercised exactly as it runs live. The selectors themselves
+-   * (`.zillow-map-layer`, `.is-hovered`) are transcribed from docs/map-linking.md's
+-   * live recon, not verified in this suite -- see that doc for the actual page measurements.
++   * The projection is now fitted from the map's own geographic bounds in the URL's
++   * searchQueryState, not from synthetic hover probes. The probe approach was removed after
++   * being measured broken live on two counts (see zillow.js buildMapProjection): it searched
++   * the wrong `.zillow-map-layer`, and it read `.is-hovered` synchronously while Zillow only
++   * applies that class on a later tick. These tests therefore assert the bounds fit, the
++   * layer-selection fix, and that calibration dispatches no events at all.
+    */
+-  function wireCardToMarker(card: Element, marker: Element) {
+-    card.addEventListener('mouseover', () => marker.classList.add('is-hovered'));
+-    card.addEventListener('mouseout', () => marker.classList.remove('is-hovered'));
+-  }
+-
+-  function nextDataScript(listResults: unknown[]) {
+-    const script = document.createElement('script');
+-    script.id = '__NEXT_DATA__';
+-    script.type = 'application/json';
+-    script.textContent = JSON.stringify({
+-      props: { pageProps: { searchPageState: { cat1: { searchResults: { listResults } } } } }
+-    });
+-    return script;
+-  }
+-
+   function mockRect(el: HTMLElement, rect: { left: number; top: number; width: number; height: number }) {
+     el.getBoundingClientRect = () => ({
+       ...rect, right: rect.left + rect.width, bottom: rect.top + rect.height,
+@@ -943,80 +939,110 @@ describe('ZillowAdapter - map pin projection', () => {
+     });
+   }
+ 
++  const BOUNDS = { west: -97.8, east: -97.6, south: 30.2, north: 30.4 };
++
++  function urlWithBounds(bounds: unknown) {
++    const state = encodeURIComponent(JSON.stringify({ isMapVisible: true, mapBounds: bounds }));
++    return `https://www.zillow.com/austin-tx/?searchQueryState=${state}`;
++  }
++
+   beforeEach(() => {
+-    setLocation('https://www.zillow.com/shoreline-wa/');
++    setLocation(urlWithBounds(BOUNDS));
+     document.body.innerHTML = '';
+ 
++    // Zillow renders two of these and querySelector returns the marker-less one first.
++    // The decoy is deliberately first in document order so a regression to
++    // querySelector('.zillow-map-layer') fails this suite.
++    const decoy = document.createElement('div');
++    decoy.className = 'zillow-map-layer';
++    mockRect(decoy, { left: 0, top: 0, width: 0, height: 0 });
++    document.body.appendChild(decoy);
++
+     const layer = document.createElement('div');
+     layer.className = 'zillow-map-layer';
+-    mockRect(layer, { left: 0, top: 0, width: 1000, height: 800 });
++    mockRect(layer, { left: 0, top: 0, width: 0, height: 0 });
++    const marker = document.createElement('div');
++    marker.className = 'streamlined-marker-container';
++    layer.appendChild(marker);
+     document.body.appendChild(layer);
+ 
+-    const markerA = document.createElement('div');
+-    markerA.className = 'property-marker';
+-    mockRect(markerA, { left: 396, top: 296, width: 8, height: 8 });
+-    layer.appendChild(markerA);
+-
+-    const markerB = document.createElement('div');
+-    markerB.className = 'property-marker';
+-    mockRect(markerB, { left: 596, top: 96, width: 8, height: 8 });
+-    layer.appendChild(markerB);
++    const clip = document.createElement('div');
++    clip.id = 'search-page-map';
++    mockRect(clip, { left: 0, top: 0, width: 1000, height: 800 });
++    document.body.appendChild(clip);
++  });
+ 
+-    const cardA = document.createElement('article');
+-    cardA.id = 'zpid_1111';
+-    cardA.innerHTML = '<a href="/homedetails/a/1111_zpid/">a</a>';
+-    document.body.appendChild(cardA);
++  it('selects the map layer that actually holds markers, not the first in the document', () => {
++    const container = ZillowAdapter.mapPinContainer!() as Element;
++    expect(container.querySelector('.streamlined-marker-container')).not.toBeNull();
++  });
+ 
+-    const cardB = document.createElement('article');
+-    cardB.id = 'zpid_2222';
+-    cardB.innerHTML = '<a href="/homedetails/b/2222_zpid/">b</a>';
+-    document.body.appendChild(cardB);
++  it('returns null with no map layer on the page', () => {
++    document.querySelectorAll('.zillow-map-layer').forEach((el) => el.remove());
++    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
++  });
+ 
+-    wireCardToMarker(cardA, markerA);
+-    wireCardToMarker(cardB, markerB);
++  it('returns null with no clip element', () => {
++    document.getElementById('search-page-map')!.remove();
++    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
++  });
+ 
+-    document.body.appendChild(nextDataScript([
+-      { zpid: 1111, latLong: { latitude: 30.2672, longitude: -97.7431 } },
+-      { zpid: 2222, latLong: { latitude: 30.3072, longitude: -97.7031 } }
+-    ]));
++  // A cold landing carries no searchQueryState until the map settles. Drawing nothing is
++  // correct; the next reconcile picks it up. Never fall back to probing.
++  it('returns null when the URL carries no bounds yet', () => {
++    setLocation('https://www.zillow.com/austin-tx/');
++    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+   });
+ 
+-  it('returns null with no map layer on the page', () => {
+-    document.querySelector('.zillow-map-layer')!.remove();
++  it('returns null on all-zero bounds rather than fitting a degenerate projection', () => {
++    setLocation(urlWithBounds({ west: 0, east: 0, south: 0, north: 0 }));
+     expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+   });
+ 
+-  it('returns null with fewer than two cards carrying known coordinates', () => {
+-    document.getElementById('__NEXT_DATA__')!.textContent = JSON.stringify({
+-      props: { pageProps: { searchPageState: { cat1: { searchResults: { listResults: [
+-        { zpid: 1111, latLong: { latitude: 30.2672, longitude: -97.7431 } }
+-      ] } } } } }
+-    });
++  it('returns null on out-of-range bounds', () => {
++    setLocation(urlWithBounds({ west: -97.8, east: -97.6, south: 30.2, north: 999 }));
+     expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+   });
+ 
+-  it('calibrates from two hover probes and projects a held-out point', () => {
++  it('fits the pane corners to the bounds corners', () => {
+     const projection = ZillowAdapter.buildMapProjection!();
+     expect(projection).not.toBeNull();
+ 
+-    // A third point, not one of the two calibration anchors -- checks the fit rather
+-    // than just echoing an anchor back.
+-    const result = ZillowAdapter.projectPoint!(projection, 30.2872, -97.7231)!;
+-    expect(result.x).toBeCloseTo(500, 0);
+-    expect(result.y).toBeCloseTo(200, 0);
+-  });
++    const nw = ZillowAdapter.projectPoint!(projection, BOUNDS.north, BOUNDS.west)!;
++    expect(nw.x).toBeCloseTo(0, 6);
++    expect(nw.y).toBeCloseTo(0, 6);
+ 
+-  it('leaves no marker still hovered after calibration', () => {
+-    ZillowAdapter.buildMapProjection!();
+-    expect(document.querySelector('.is-hovered')).toBeNull();
++    const se = ZillowAdapter.projectPoint!(projection, BOUNDS.south, BOUNDS.east)!;
++    expect(se.x).toBeCloseTo(1000, 6);
++    expect(se.y).toBeCloseTo(800, 6);
+   });
+ 
+-  it('returns null when hovering a card lights up no marker (selector drift)', () => {
+-    // A clone carries the same markup but none of the wired listeners, standing in for
+-    // hovering doing nothing -- exactly what a changed site class name would look like.
+-    const cardA = document.getElementById('zpid_1111')!;
+-    cardA.replaceWith(cardA.cloneNode(true));
+-    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
++  it('projects a held-out interior point', () => {
++    const projection = ZillowAdapter.buildMapProjection!();
++    const mid = ZillowAdapter.projectPoint!(projection, 30.3, -97.7)!;
++    // Longitude is exactly linear, so the horizontal midpoint is exact.
++    expect(mid.x).toBeCloseTo(500, 6);
++    // Latitude goes through mercator, which is very nearly linear across 0.2 degrees --
++    // assert it lands near the vertical midpoint without over-claiming precision.
++    expect(mid.y).toBeGreaterThan(395);
++    expect(mid.y).toBeLessThan(405);
++  });
++
++  it('reports the clip rect and a zero anchor, since the fit yields the true geo point', () => {
++    const projection = ZillowAdapter.buildMapProjection!()!;
++    expect(projection.clip!.width).toBe(1000);
++    expect(projection.clip!.height).toBe(800);
++    expect(projection.anchor).toEqual({ dx: 0, dy: 0 });
++  });
++
++  // The whole point of the rewrite: calibration must not touch the page.
++  it('dispatches no events while calibrating', () => {
++    const seen: string[] = [];
++    for (const type of ['mouseover', 'mouseout', 'mousemove', 'pointerover', 'click']) {
++      document.addEventListener(type, () => seen.push(type), true);
++    }
++    ZillowAdapter.buildMapProjection!();
++    expect(seen).toEqual([]);
+   });
+ 
+   it('projectPoint no-ops to null on a null projection', () => {
+diff --git a/tools/panel-harness.html b/tools/panel-harness.html
+index 1a68930..e57018a 100644
+--- a/tools/panel-harness.html
++++ b/tools/panel-harness.html
+@@ -41,8 +41,38 @@
+         if (cb) { cb(out); return; }
+         return Promise.resolve(out);
+       }
++      // storage.onChanged, so the harness can exercise the reactive paths the real
++      // extension uses (showHousesOnMap, storedHouses, compSession) rather than only
++      // request/response messaging.
++      const changeListeners = [];
++      function emitChanges(changes) {
++        if (!Object.keys(changes).length) return;
++        for (const l of [...changeListeners]) {
++          try { l(changes, 'local'); } catch (e) { console.error('[harness] onChanged listener threw', e); }
++        }
++      }
++
+       function set(items, cb) {
+-        for (const [k, v] of Object.entries(items)) store[k] = structuredClone(v);
++        const changes = {};
++        for (const [k, v] of Object.entries(items)) {
++          const oldValue = k in store ? structuredClone(store[k]) : undefined;
++          store[k] = structuredClone(v);
++          changes[k] = { oldValue, newValue: structuredClone(v) };
++        }
++        emitChanges(changes);
++        if (cb) { cb(); return; }
++        return Promise.resolve();
++      }
++
++      function remove(keys, cb) {
++        const list = Array.isArray(keys) ? keys : [keys];
++        const changes = {};
++        for (const k of list) {
++          if (!(k in store)) continue;
++          changes[k] = { oldValue: structuredClone(store[k]), newValue: undefined };
++          delete store[k];
++        }
++        emitChanges(changes);
+         if (cb) { cb(); return; }
+         return Promise.resolve();
+       }
+@@ -62,7 +92,16 @@
+       }
+ 
+       window.chrome = {
+-        storage: { local: { get, set } },
++        storage: {
++          local: { get, set, remove },
++          onChanged: {
++            addListener: (l) => changeListeners.push(l),
++            removeListener: (l) => {
++              const i = changeListeners.indexOf(l);
++              if (i !== -1) changeListeners.splice(i, 1);
++            }
++          }
++        },
+         runtime: {
+           sendMessage,
+           lastError: undefined,
+@@ -76,7 +115,18 @@
+           onInstalled: { addListener: () => {} }
+         },
+         // Only reached on the delete path, to tell a content script the house is gone.
+-        tabs: { query: (_q, cb) => cb([]), sendMessage: () => {} },
++        // The onCreated/onRemoved/onUpdated stubs are no-ops but must exist: background.js
++        // registers listeners on all three at load, and any one of them being undefined
++        // throws, aborting the worker so the panel never mounts.
++        tabs: {
++          query: (_q, cb) => cb([]),
++          sendMessage: () => {},
++          create: () => {},
++          update: () => {},
++          onCreated: { addListener: () => {} },
++          onRemoved: { addListener: () => {} },
++          onUpdated: { addListener: () => {} }
++        },
+         sidePanel: { setPanelBehavior: () => {} }
+       };
+ 

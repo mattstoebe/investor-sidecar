@@ -152,6 +152,17 @@ var HomesAdapter = (function () {
 
   const cardPk = (card) => card?.getAttribute('data-pk') || null;
 
+  function geoForPk(propertyID) {
+    if (!propertyID) return null;
+    const marker = [...document.querySelectorAll('gmp-advanced-marker[data-pin-pk][position]')]
+      .find((el) => el.getAttribute('data-pin-pk') === propertyID);
+    if (!marker) return null;
+    const [latitude, longitude] = (marker.getAttribute('position') || '').split(',').map(Number);
+    return Number.isFinite(latitude) && Number.isFinite(longitude)
+      ? { latitude, longitude }
+      : null;
+  }
+
   const cardHref = (card) =>
     card?.querySelector('a[href*="/property/"]')?.getAttribute('href')
     // Present on some markets and absent on others (Austin had it, Chicago didn't), so
@@ -165,6 +176,9 @@ var HomesAdapter = (function () {
   function mapPopupHouse(popup) {
     const link = popup?.querySelector('a[data-pk][href*="/property/"]');
     if (!link) return null;
+    const propertyID = link.getAttribute('data-pk')
+      || homesPropertyId(P.pathnameOf(link.getAttribute('href'), window.location.origin));
+    const geo = geoForPk(propertyID);
     const facts = parseFacts(P.separatedText(popup.querySelector('.property-info-container')));
     const address = [
       popup.querySelector('.property-address')?.textContent?.trim(),
@@ -177,10 +191,10 @@ var HomesAdapter = (function () {
       beds: facts.beds,
       baths: facts.baths,
       sqft: facts.sqft,
-      propertyID: link.getAttribute('data-pk') || homesPropertyId(P.pathnameOf(link.getAttribute('href'), window.location.origin)),
+      propertyID,
       url: P.absoluteUrl(link.getAttribute('href'), window.location.origin),
-      latitude: null,
-      longitude: null,
+      latitude: geo?.latitude ?? null,
+      longitude: geo?.longitude ?? null,
       hoa: null
     };
   }
@@ -381,6 +395,8 @@ var HomesAdapter = (function () {
       // separatedText() the Zillow adapter uses would be parsing HTML here.
       const facts = parseFacts(P.separatedText(card.querySelector('.detailed-info-container')));
       const href = cardHref(card);
+      const propertyID = cardPk(card) ?? homesPropertyId(P.pathnameOf(href, window.location.origin));
+      const geo = geoForPk(propertyID);
 
       return {
         source: 'homes',
@@ -395,12 +411,10 @@ var HomesAdapter = (function () {
         // data-pk is the same key the detail URL ends with -- checked against all 40 cards
         // on a results page with zero mismatches -- so a card capture and a detail capture
         // of one property dedupe to the same houseKey.
-        propertyID: cardPk(card) ?? homesPropertyId(P.pathnameOf(href, window.location.origin)),
+        propertyID,
         url: P.absoluteUrl(href, window.location.origin),
-        // Cards carry neither geo nor fee, on any of the three sites. The panel surfaces
-        // the missing rent estimate rather than the capture failing.
-        latitude: null,
-        longitude: null,
+        latitude: geo?.latitude ?? null,
+        longitude: geo?.longitude ?? null,
         hoa: null
       };
     },
@@ -457,6 +471,66 @@ var HomesAdapter = (function () {
     detailButtonClassName: 'bp-CalculatorExtension sidecar-Button--action',
     detailWrapperClassName: 'sidecar-ActionWrapper',
 
+    mapPinContainer() {
+      return document.querySelector('gmp-advanced-marker')?.parentElement ?? null;
+    },
+
+    mapClipElement() {
+      return document.querySelector('#map.search-map-container')
+        ?? document.querySelector('.search-map-container');
+    },
+
+    mapPinAnchorOffset() {
+      return { dx: 14.5, dy: 40 };
+    },
+
+    buildMapProjection() {
+      const container = this.mapPinContainer();
+      if (!container) return null;
+
+      const points = [];
+      for (const el of container.querySelectorAll('gmp-advanced-marker[position]')) {
+        const [lat, lon] = (el.getAttribute('position') || '').split(',').map(Number);
+        const match = getComputedStyle(el).transform.match(/matrix\(([^)]+)\)/);
+        if (!match || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        const matrix = match[1].split(',').map(Number);
+        const x = matrix[4];
+        const y = matrix[5];
+        if (Number.isFinite(x) && Number.isFinite(y)) points.push({ lat, lon, x, y });
+      }
+      if (points.length < 2) return null;
+
+      const spread = (key) => {
+        let min = points[0], max = points[0];
+        for (const point of points) {
+          if (point[key] < min[key]) min = point;
+          if (point[key] > max[key]) max = point;
+        }
+        return [min, max];
+      };
+
+      const [minLon, maxLon] = spread('lon');
+      let fit = SidecarGeoProjection.fit(minLon, maxLon);
+      if (!fit) {
+        const [minLat, maxLat] = spread('lat');
+        fit = SidecarGeoProjection.fit(minLat, maxLat);
+      }
+      if (!fit) return null;
+
+      const clipEl = this.mapClipElement();
+      return {
+        container,
+        host: clipEl,
+        fit,
+        clip: clipEl ? clipEl.getBoundingClientRect() : null,
+        anchor: this.mapPinAnchorOffset()
+      };
+    },
+
+    projectPoint(projection, lat, lon) {
+      return projection ? SidecarGeoProjection.project(projection.fit, lat, lon) : null;
+    },
+
     diagnostics() {
       const pk = homesPropertyId(window.location.pathname);
       return {
@@ -464,6 +538,8 @@ var HomesAdapter = (function () {
         detailPage: this.isDetailPage(),
         detailTarget: !!this.detailInjectionTarget(),
         pk,
+        mapPinContainer: !!this.mapPinContainer(),
+        mapProjection: !!this.buildMapProjection(),
         hasLdJson: !!listingLdJson(pk),
         subjectFacts: subjectFacts()
       };

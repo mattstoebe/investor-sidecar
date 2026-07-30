@@ -59,6 +59,7 @@ export interface Comp {
 }
 
 type CompSearchSource = 'redfin' | 'zillow' | 'homes';
+type MapVisibilityState = { defaultVisible: boolean; exceptions: string[] };
 
 const COMP_SEARCH_SOURCES: Array<{ id: CompSearchSource; label: string; className: string }> = [
   { id: 'redfin', label: 'Redfin', className: 'text-red-600 dark:text-red-400' },
@@ -710,11 +711,14 @@ function CompSearchLinks({ kind, subjectSource, onStart }: {
   );
 }
 
-export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highlighted }: {
+export function HouseCard({ house, globalParams, onRemoved, onModeChanged, onShowOnMap, onMapHighlight, mapVisible, highlighted }: {
   house: House,
   globalParams: GlobalParameters,
   onRemoved?: (address: string) => void,
   onModeChanged?: (label: string) => void,
+  onShowOnMap?: (house: House) => void,
+  onMapHighlight?: (key: string | null) => void,
+  mapVisible?: boolean,
   highlighted?: boolean
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
@@ -1236,6 +1240,12 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
       ref={cardRef}
       data-testid="house-card"
       data-property-id={house.propertyID}
+      onMouseEnter={() => onMapHighlight?.(houseKey(house))}
+      onMouseLeave={() => onMapHighlight?.(null)}
+      onFocusCapture={() => onMapHighlight?.(houseKey(house))}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) onMapHighlight?.(null);
+      }}
       className={`bg-gray-50 dark:bg-gray-800 p-4 rounded-lg mb-4 text-gray-700 dark:text-gray-300 shadow-sm border transition-colors ${
         highlighted ? 'border-purple-500 ring-2 ring-purple-400' : 'border-gray-200 dark:border-gray-700'
       }`}
@@ -1266,6 +1276,20 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, highl
       <div className="pt-3">
         <div className="space-y-3">
           <div className="flex justify-end gap-1 -mt-1">
+              <button
+                type="button"
+                aria-label={`Show ${house.address || 'house'} on map`}
+                title={mapVisible
+                  ? 'Hide from map'
+                  : house.latitude === null || house.longitude === null
+                    ? 'Location unavailable for this saved house'
+                    : 'Show on map'}
+                disabled={!mapVisible && (house.latitude === null || house.longitude === null)}
+                className="text-pink-500 hover:text-pink-600 disabled:text-gray-300 disabled:cursor-not-allowed px-1 text-xs font-medium"
+                onClick={() => onShowOnMap?.(house)}
+              >
+                {mapVisible ? 'Hide from map' : 'Show on map'}
+              </button>
               <button
                 type="button"
                 aria-label={`Open listing on ${SITE_NAMES[house.source ?? 'redfin']}`}
@@ -1490,25 +1514,22 @@ function SidePanel() {
   const [undoState, setUndoState] = useState<UndoSummary>({ depth: 0, label: null });
   /** What the toast is currently offering to undo. Null hides it. */
   const [toast, setToast] = useState<string | null>(null);
-  /** Mirrors chrome.storage.local's showHousesOnMap -- content.js reads that key directly
-   *  (docs/map-linking.md Option 3), so this panel is a plain writer, not the owner. */
-  const [showHousesOnMap, setShowHousesOnMap] = useState(false);
+  const [mapVisibility, setMapVisibility] = useState<MapVisibilityState>({
+    defaultVisible: false,
+    exceptions: []
+  });
   /** Set by a click on one of our pins on the site's own map; cleared a few seconds later
    *  so the ring is a flash, not a permanent marker. */
   const [highlightedHouseKey, setHighlightedHouseKey] = useState<string | null>(null);
   /** How many saved-with-coordinates houses are currently pinned on the visible map, from
    *  the content script's own reconciliation -- null until one ever reports in. */
-  const [mapStatus, setMapStatus] = useState<{ shown: number; total: number } | null>(null);
+  const [mapStatus, setMapStatus] = useState<{ shown: number; total: number; missing: number } | null>(null);
 
   useEffect(() => {
     if (!highlightedHouseKey) return;
     const timer = setTimeout(() => setHighlightedHouseKey(null), 3000);
     return () => clearTimeout(timer);
   }, [highlightedHouseKey]);
-
-  useEffect(() => {
-    chrome.storage.local.set({ showHousesOnMap });
-  }, [showHousesOnMap]);
 
   const requestUndo = useCallback(async () => {
     setToast(null);
@@ -1540,7 +1561,9 @@ function SidePanel() {
   useEffect(() => {
     const loadData = async () => {
       try {
-        const result = await chrome.storage.local.get(['storedHouses', 'globalParams']);
+        const result = await chrome.storage.local.get([
+          'storedHouses', 'globalParams', 'mapVisibility', 'showHousesOnMap'
+        ]);
         if (result.storedHouses) {
           setHouses(result.storedHouses);
         }
@@ -1552,6 +1575,15 @@ function SidePanel() {
           // harmlessly -- nothing reads them.
           setGlobalParams(migrateGlobalParams(result.globalParams));
         }
+        const storedMapVisibility = result.mapVisibility as Partial<MapVisibilityState> | undefined;
+        setMapVisibility({
+          defaultVisible: typeof storedMapVisibility?.defaultVisible === 'boolean'
+            ? storedMapVisibility.defaultVisible
+            : Boolean(result.showHousesOnMap),
+          exceptions: Array.isArray(storedMapVisibility?.exceptions)
+            ? storedMapVisibility.exceptions.filter((key): key is string => typeof key === 'string')
+            : []
+        });
       } catch (error) {
         console.error("Error loading data:", error);
       }
@@ -1588,7 +1620,24 @@ function SidePanel() {
       ) {
         const shown = (message as { shown?: unknown }).shown;
         const total = (message as { total?: unknown }).total;
-        if (typeof shown === 'number' && typeof total === 'number') setMapStatus({ shown, total });
+        const missing = (message as { missing?: unknown }).missing;
+        if (typeof shown === 'number' && typeof total === 'number') {
+          setMapStatus({ shown, total, missing: typeof missing === 'number' ? missing : 0 });
+        }
+        return;
+      }
+
+      if (
+        typeof message === 'object' && message !== null &&
+        (message as { action?: string }).action === 'mapVisibilityUpdated'
+      ) {
+        const state = (message as { state?: Partial<MapVisibilityState> }).state;
+        if (typeof state?.defaultVisible === 'boolean' && Array.isArray(state.exceptions)) {
+          setMapVisibility({
+            defaultVisible: state.defaultVisible,
+            exceptions: state.exceptions.filter((key): key is string => typeof key === 'string')
+          });
+        }
       }
     };
 
@@ -1608,6 +1657,35 @@ function SidePanel() {
     chrome.storage.local.set({ globalParams });
   }, [globalParams]);
 
+  const highlightMapHouse = useCallback((key: string | null) => {
+    chrome.runtime.sendMessage({ action: 'highlightMapHouse', key }).catch(() => {});
+  }, []);
+
+  const mapExceptions = useMemo(() => new Set(mapVisibility.exceptions), [mapVisibility.exceptions]);
+  const houseIsVisible = useCallback((house: House) => {
+    const excepted = mapExceptions.has(houseKey(house));
+    return excepted ? !mapVisibility.defaultVisible : mapVisibility.defaultVisible;
+  }, [mapExceptions, mapVisibility.defaultVisible]);
+  const visibleHouseCount = houses.filter(houseIsVisible).length;
+
+  const toggleHouseOnMap = useCallback(async (house: House) => {
+    if ((house.latitude === null || house.longitude === null) && !houseIsVisible(house)) return;
+    const key = houseKey(house);
+    const response = await chrome.runtime.sendMessage({ action: 'toggleMapHouse', key });
+    if (response?.ok && response.state) setMapVisibility(response.state);
+    if (houseIsVisible(house) === false) {
+      chrome.runtime.sendMessage({ action: 'focusMapHouse', key }).catch(() => {});
+    }
+  }, [houseIsVisible]);
+
+  const toggleAllMapHouses = useCallback(async () => {
+    const response = await chrome.runtime.sendMessage({
+      action: 'setMapDefault',
+      visible: !mapVisibility.defaultVisible
+    });
+    if (response?.ok && response.state) setMapVisibility(response.state);
+  }, [mapVisibility.defaultVisible]);
+
   return (
     <div className={`min-h-screen p-4 ${globalParams.isDarkMode ? 'dark bg-gray-900' : 'bg-gray-100'}`}>
       <Title />
@@ -1619,22 +1697,26 @@ function SidePanel() {
         <div className="flex items-center gap-2 mb-3">
           <button
             type="button"
-            onClick={() => setShowHousesOnMap((v) => !v)}
-            aria-pressed={showHousesOnMap}
+            onClick={toggleAllMapHouses}
+            aria-pressed={mapVisibility.defaultVisible}
             className={`text-sm rounded px-2 py-1 border transition-colors ${
-              showHousesOnMap
+              mapVisibility.defaultVisible
                 ? 'bg-purple-600 border-purple-600 text-white'
                 : 'bg-white dark:bg-gray-800 border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200'
             }`}
           >
-            {showHousesOnMap ? 'Showing on map' : 'Show on map'}
+            {mapVisibility.defaultVisible ? 'Hide all from map' : 'Show all on map'}
           </button>
           {/* Never a claim that every saved house is pinned -- off-viewport houses are
               never forced into view (docs/map-linking.md, anti-bot posture), so this is
               the honest alternative to a silent gap. */}
-          {showHousesOnMap && mapStatus && (
+          {visibleHouseCount > 0 && mapStatus && (
             <span className="text-xs text-gray-500 dark:text-gray-400">
-              {mapStatus.shown} of {mapStatus.total} shown on this map
+              {mapStatus.shown} of {mapStatus.total} located shown
+              {mapStatus.missing > 0 ? ` · ${mapStatus.missing} missing location` : ''}
+              {mapVisibility.exceptions.length > 0
+                ? ` · ${mapVisibility.exceptions.length} individual override${mapVisibility.exceptions.length === 1 ? '' : 's'}`
+                : ''}
             </span>
           )}
         </div>
@@ -1669,6 +1751,9 @@ function SidePanel() {
               globalParams={globalParams}
               onRemoved={(address) => setToast(`Removed ${address}`)}
               onModeChanged={(label) => setToast(`Switched to ${label}`)}
+              onShowOnMap={toggleHouseOnMap}
+              onMapHighlight={highlightMapHouse}
+              mapVisible={houseIsVisible(house)}
               highlighted={highlightedHouseKey === houseKey(house)}
             />
           ))

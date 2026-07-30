@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -62,7 +62,15 @@ interface SiteAdapter {
   isRentalDetailPage?(): boolean;
   listingStatusFromCard?(el: Element): string | null;
   mapPinContainer?(): Element | null;
-  buildMapProjection?(): { container: Element; fit: unknown } | null;
+  buildMapProjection?(): {
+    container: Element;
+    fit: unknown;
+    clip?: DOMRect | null;
+    anchor?: { dx: number; dy: number };
+  } | null;
+  mapClipElement?(): Element | null;
+  mapPinAnchorOffset?(): { dx: number; dy: number };
+  nativeMapPinForHouse?(house: Partial<HouseData>): Element | null;
   projectPoint?(projection: unknown, lat: number, lon: number): { x: number; y: number } | null;
 }
 
@@ -74,7 +82,10 @@ function setLocation(href: string) {
   const url = new URL(href);
   Object.defineProperty(window, 'location', {
     configurable: true,
-    value: { ...window.location, href, hostname: url.hostname, pathname: url.pathname, origin: url.origin }
+    value: {
+      ...window.location, href, hostname: url.hostname, pathname: url.pathname,
+      origin: url.origin, search: url.search
+    }
   });
 }
 
@@ -245,6 +256,30 @@ describe('RedfinAdapter - detail page', () => {
     expect(h.propertyID).toBe('77753');
     expect(h.hoa).toBe(145);
     expect(h.latitude).toBeCloseTo(47.77, 2);
+  });
+
+  it('reads coordinates from mainEntity.geo and coerces strings to numbers', () => {
+    const script = document.querySelector('script[type="application/ld+json"]')!;
+    script.textContent = JSON.stringify([{
+      '@type': 'SingleFamilyResidence',
+      url: 'https://www.redfin.com/WA/Shoreline/322-NW-200th-St-98177/for-sale/77753',
+      mainEntity: { geo: { latitude: '47.771', longitude: '-122.351' } }
+    }]);
+
+    expect(RedfinAdapter.extractFromDetailPage()).toMatchObject({
+      latitude: 47.771,
+      longitude: -122.351
+    });
+  });
+
+  it('uses the scoped geo.position meta fallback on a detail page', () => {
+    document.querySelector('script[type="application/ld+json"]')!.remove();
+    document.head.innerHTML = '<meta name="geo.position" content="47.772;-122.352">';
+
+    expect(RedfinAdapter.extractFromDetailPage()).toMatchObject({
+      latitude: 47.772,
+      longitude: -122.352
+    });
   });
 
   it('returns null rather than a partial record when the stats block is absent', () => {
@@ -443,6 +478,19 @@ describe('RedfinAdapter - map pin projection', () => {
 
   it('projectPoint no-ops to null on a null projection', () => {
     expect(RedfinAdapter.projectPoint!(null, 30.27, -97.74)).toBeNull();
+  });
+
+  it('finds the native marker for a saved house by coordinates', () => {
+    document.body.innerHTML = '<div class="HomeMarkersContainer"></div>';
+    const container = document.querySelector('.HomeMarkersContainer')!;
+    const target = pin(30.2672, -97.7431, 400, 300);
+    container.appendChild(target);
+    container.appendChild(pin(30.3072, -97.7031, 600, 100));
+
+    expect(RedfinAdapter.nativeMapPinForHouse!({
+      latitude: 30.2672,
+      longitude: -97.7431
+    })).toBe(target);
   });
 });
 
@@ -912,30 +960,6 @@ describe('ZillowAdapter - card geo from listResults', () => {
 });
 
 describe('ZillowAdapter - map pin projection', () => {
-  /**
-   * jsdom runs no Zillow JS, so nothing lights up a marker on hover by itself. This
-   * fixture wires a plain mouseover/mouseout listener on each card that toggles
-   * `.is-hovered` on its paired marker -- standing in for the real site's own React
-   * handler, so the calibration code under test (event dispatch, marker lookup,
-   * projection fit) is exercised exactly as it runs live. The selectors themselves
-   * (`.zillow-map-layer`, `.is-hovered`) are transcribed from docs/map-linking.md's
-   * live recon, not verified in this suite -- see that doc for the actual page measurements.
-   */
-  function wireCardToMarker(card: Element, marker: Element) {
-    card.addEventListener('mouseover', () => marker.classList.add('is-hovered'));
-    card.addEventListener('mouseout', () => marker.classList.remove('is-hovered'));
-  }
-
-  function nextDataScript(listResults: unknown[]) {
-    const script = document.createElement('script');
-    script.id = '__NEXT_DATA__';
-    script.type = 'application/json';
-    script.textContent = JSON.stringify({
-      props: { pageProps: { searchPageState: { cat1: { searchResults: { listResults } } } } }
-    });
-    return script;
-  }
-
   function mockRect(el: HTMLElement, rect: { left: number; top: number; width: number; height: number }) {
     el.getBoundingClientRect = () => ({
       ...rect, right: rect.left + rect.width, bottom: rect.top + rect.height,
@@ -943,80 +967,142 @@ describe('ZillowAdapter - map pin projection', () => {
     });
   }
 
+  const bounds = { west: -97.8, east: -97.6, south: 30.2, north: 30.4 };
+  const urlWithBounds = (value: unknown) => {
+    const state = encodeURIComponent(JSON.stringify({ isMapVisible: true, mapBounds: value }));
+    return `https://www.zillow.com/austin-tx/?searchQueryState=${state}`;
+  };
+
   beforeEach(() => {
-    setLocation('https://www.zillow.com/shoreline-wa/');
+    setLocation(urlWithBounds(bounds));
     document.body.innerHTML = '';
+
+    const decoy = document.createElement('div');
+    decoy.className = 'zillow-map-layer';
+    mockRect(decoy, { left: 0, top: 0, width: 0, height: 0 });
+    document.body.appendChild(decoy);
 
     const layer = document.createElement('div');
     layer.className = 'zillow-map-layer';
-    mockRect(layer, { left: 0, top: 0, width: 1000, height: 800 });
+    mockRect(layer, { left: 0, top: 0, width: 0, height: 0 });
+    const marker = document.createElement('div');
+    marker.className = 'streamlined-marker-container';
+    layer.appendChild(marker);
     document.body.appendChild(layer);
 
-    const markerA = document.createElement('div');
-    markerA.className = 'property-marker';
-    mockRect(markerA, { left: 396, top: 296, width: 8, height: 8 });
-    layer.appendChild(markerA);
+    const clip = document.createElement('div');
+    clip.id = 'search-page-map';
+    mockRect(clip, { left: 0, top: 0, width: 1000, height: 800 });
+    document.body.appendChild(clip);
+  });
 
-    const markerB = document.createElement('div');
-    markerB.className = 'property-marker';
-    mockRect(markerB, { left: 596, top: 96, width: 8, height: 8 });
-    layer.appendChild(markerB);
-
-    const cardA = document.createElement('article');
-    cardA.id = 'zpid_1111';
-    cardA.innerHTML = '<a href="/homedetails/a/1111_zpid/">a</a>';
-    document.body.appendChild(cardA);
-
-    const cardB = document.createElement('article');
-    cardB.id = 'zpid_2222';
-    cardB.innerHTML = '<a href="/homedetails/b/2222_zpid/">b</a>';
-    document.body.appendChild(cardB);
-
-    wireCardToMarker(cardA, markerA);
-    wireCardToMarker(cardB, markerB);
-
-    document.body.appendChild(nextDataScript([
-      { zpid: 1111, latLong: { latitude: 30.2672, longitude: -97.7431 } },
-      { zpid: 2222, latLong: { latitude: 30.3072, longitude: -97.7031 } }
-    ]));
+  it('selects the marker-bearing layer rather than the first layer', () => {
+    expect(ZillowAdapter.mapPinContainer!()!.querySelector('.streamlined-marker-container')).not.toBeNull();
   });
 
   it('returns null with no map layer on the page', () => {
-    document.querySelector('.zillow-map-layer')!.remove();
+    document.querySelectorAll('.zillow-map-layer').forEach((el) => el.remove());
     expect(ZillowAdapter.buildMapProjection!()).toBeNull();
   });
 
-  it('returns null with fewer than two cards carrying known coordinates', () => {
-    document.getElementById('__NEXT_DATA__')!.textContent = JSON.stringify({
-      props: { pageProps: { searchPageState: { cat1: { searchResults: { listResults: [
-        { zpid: 1111, latLong: { latitude: 30.2672, longitude: -97.7431 } }
-      ] } } } } }
-    });
+  it('returns null with no clip element or URL bounds', () => {
+    document.getElementById('search-page-map')!.remove();
+    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+    setLocation('https://www.zillow.com/austin-tx/');
     expect(ZillowAdapter.buildMapProjection!()).toBeNull();
   });
 
-  it('calibrates from two hover probes and projects a held-out point', () => {
-    const projection = ZillowAdapter.buildMapProjection!();
-    expect(projection).not.toBeNull();
-
-    // A third point, not one of the two calibration anchors -- checks the fit rather
-    // than just echoing an anchor back.
-    const result = ZillowAdapter.projectPoint!(projection, 30.2872, -97.7231)!;
-    expect(result.x).toBeCloseTo(500, 0);
-    expect(result.y).toBeCloseTo(200, 0);
-  });
-
-  it('leaves no marker still hovered after calibration', () => {
-    ZillowAdapter.buildMapProjection!();
-    expect(document.querySelector('.is-hovered')).toBeNull();
-  });
-
-  it('returns null when hovering a card lights up no marker (selector drift)', () => {
-    // A clone carries the same markup but none of the wired listeners, standing in for
-    // hovering doing nothing -- exactly what a changed site class name would look like.
-    const cardA = document.getElementById('zpid_1111')!;
-    cardA.replaceWith(cardA.cloneNode(true));
+  it('rejects degenerate and out-of-range bounds', () => {
+    setLocation(urlWithBounds({ west: 0, east: 0, south: 0, north: 0 }));
     expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+    setLocation(urlWithBounds({ west: -97.8, east: -97.6, south: 30.2, north: 999 }));
+    expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+  });
+
+  it('fits the map pane to URL bounds without dispatching page events', () => {
+    const seen: string[] = [];
+    for (const type of ['mouseover', 'mouseout', 'mousemove', 'pointerover', 'click']) {
+      document.addEventListener(type, () => seen.push(type), { capture: true, once: true });
+    }
+
+    const projection = ZillowAdapter.buildMapProjection!()!;
+    expect(seen).toEqual([]);
+    const nw = ZillowAdapter.projectPoint!(projection, bounds.north, bounds.west)!;
+    const se = ZillowAdapter.projectPoint!(projection, bounds.south, bounds.east)!;
+    expect(nw.x).toBeCloseTo(0, 6);
+    expect(nw.y).toBeCloseTo(0, 6);
+    expect(se.x).toBeCloseTo(1000, 6);
+    expect(se.y).toBeCloseTo(800, 6);
+    expect(projection.clip!.width).toBe(1000);
+    expect(projection.anchor).toEqual({ dx: 0, dy: 0 });
+  });
+
+  it('calibrates a cold projection with exactly two delayed card-hover probes', async () => {
+    vi.useFakeTimers();
+    try {
+      setLocation('https://www.zillow.com/austin-tx/');
+      const layer = ZillowAdapter.mapPinContainer!() as HTMLElement;
+      layer.innerHTML = '';
+      const points = [
+        { id: '1001', latitude: 30.25, longitude: -97.75, x: 200, y: 600 },
+        { id: '1002', latitude: 30.35, longitude: -97.65, x: 800, y: 200 }
+      ];
+      const payload = document.createElement('script');
+      payload.id = '__NEXT_DATA__';
+      payload.type = 'application/json';
+      payload.textContent = JSON.stringify({
+        props: {
+          pageProps: {
+            searchPageState: {
+              cat1: {
+                searchResults: {
+                  listResults: points.map((point) => ({
+                    zpid: point.id,
+                    latLong: { latitude: point.latitude, longitude: point.longitude }
+                  }))
+                }
+              }
+            }
+          }
+        }
+      });
+      document.body.appendChild(payload);
+
+      let hoverCount = 0;
+      for (const point of points) {
+        const marker = document.createElement('div');
+        marker.className = 'streamlined-marker-container';
+        const pill = document.createElement('span');
+        mockRect(pill, { left: point.x - 10, top: point.y - 10, width: 20, height: 20 });
+        marker.appendChild(pill);
+        layer.appendChild(marker);
+
+        const card = document.createElement('article');
+        card.id = `zpid_${point.id}`;
+        card.innerHTML = `<a href="/homedetails/test/${point.id}_zpid/"></a>`;
+        card.addEventListener('mouseover', () => {
+          hoverCount += 1;
+          setTimeout(() => pill.classList.add('is-hovered'), 50);
+        });
+        card.addEventListener('mouseout', () => pill.classList.remove('is-hovered'));
+        document.body.appendChild(card);
+      }
+
+      expect(ZillowAdapter.buildMapProjection!()).toBeNull();
+      await vi.advanceTimersByTimeAsync(400);
+      const projection = ZillowAdapter.buildMapProjection!();
+
+      expect(projection).not.toBeNull();
+      expect(hoverCount).toBe(2);
+      expect(document.querySelector('.is-hovered')).toBeNull();
+      const first = ZillowAdapter.projectPoint!(
+        projection!, points[0].latitude, points[0].longitude
+      )!;
+      expect(first.x).toBeCloseTo(points[0].x, 4);
+      expect(first.y).toBeCloseTo(points[0].y, 4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('projectPoint no-ops to null on a null projection', () => {

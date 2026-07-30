@@ -33,15 +33,31 @@ var RedfinAdapter = (function () {
       } catch {
         continue; // a malformed blob shouldn't abort the whole lookup
       }
-      const obj = Array.isArray(parsed) ? parsed[0] : parsed;
-      if (!obj?.geo?.latitude || !obj?.geo?.longitude) continue;
+      const objects = Array.isArray(parsed) ? parsed : [parsed];
+      for (const obj of objects) {
+        const geo = obj?.geo ?? obj?.mainEntity?.geo;
+        const latitude = Number(geo?.latitude);
+        const longitude = Number(geo?.longitude);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) continue;
 
-      const url = obj.url ?? null;
-      if (expectedId) {
-        // Require proof of identity rather than assuming the first blob is the right one.
-        if (P.redfinPropertyId(P.pathnameOf(url, window.location.origin)) !== expectedId) continue;
+        const url = obj?.url ?? obj?.mainEntity?.url ?? null;
+        if (expectedId) {
+          // Require proof of identity rather than assuming the first blob is the right one.
+          if (P.redfinPropertyId(P.pathnameOf(url, window.location.origin)) !== expectedId) continue;
+        }
+        return { latitude, longitude, url };
       }
-      return { latitude: obj.geo.latitude, longitude: obj.geo.longitude, url };
+    }
+
+    // Redfin also exposes the current detail page's coordinate in a scoped meta tag.
+    // Use it only for a whole-document lookup whose URL proves the requested identity.
+    if ((root || document) === document && expectedId
+        && P.redfinPropertyId(window.location.pathname) === expectedId) {
+      const raw = document.querySelector('meta[name="geo.position"]')?.getAttribute('content') ?? '';
+      const [latitude, longitude] = raw.split(';').map(Number);
+      if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+        return { latitude, longitude, url: window.location.href };
+      }
     }
     return null;
   }
@@ -351,6 +367,35 @@ var RedfinAdapter = (function () {
       return document.querySelector('.HomeMarkersContainer');
     },
 
+    mapClipElement() {
+      return document.querySelector('#search-map-wrapper');
+    },
+
+    mapPinAnchorOffset() {
+      return { dx: 6, dy: 6 };
+    },
+
+    nativeMapPinForHouse(house) {
+      const latitude = Number(house?.latitude);
+      const longitude = Number(house?.longitude);
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+
+      const matches = [];
+      for (const pin of document.querySelectorAll('.HomeMarkersContainer .Pushpin[latitude][longitude]')) {
+        const pinLatitude = Number(pin.getAttribute('latitude'));
+        const pinLongitude = Number(pin.getAttribute('longitude'));
+        if (!Number.isFinite(pinLatitude) || !Number.isFinite(pinLongitude)) continue;
+        const distance = Math.hypot(pinLatitude - latitude, pinLongitude - longitude);
+        matches.push({ pin, distance });
+      }
+      matches.sort((a, b) => a.distance - b.distance);
+      const nearest = matches[0];
+      if (!nearest || nearest.distance > 0.00025) return null;
+      const runnerUp = matches[1];
+      if (runnerUp && nearest.distance > 0.000001 && runnerUp.distance < nearest.distance * 2) return null;
+      return nearest.pin;
+    },
+
     /**
      * Fits a lat/lon -> screen-px projection from two of the site's own rendered pins.
      *
@@ -399,7 +444,13 @@ var RedfinAdapter = (function () {
       }
       if (!fit) return null;
 
-      return { container, fit };
+      const clipEl = this.mapClipElement();
+      return {
+        container,
+        fit,
+        clip: clipEl ? clipEl.getBoundingClientRect() : null,
+        anchor: this.mapPinAnchorOffset()
+      };
     },
 
     /** Projects a (lat, lon) through a projection built by buildMapProjection(). */

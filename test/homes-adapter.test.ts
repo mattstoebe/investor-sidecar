@@ -16,7 +16,7 @@ import { resolve } from 'node:path';
  */
 function loadAdapters() {
   const read = (p: string) => readFileSync(resolve(__dirname, '../public/scripts/sites/', p), 'utf8');
-  const bundle = [read('parsers.js'), read('homes.js')].join(';\n');
+  const bundle = [read('parsers.js'), read('geo-projection.js'), read('homes.js')].join(';\n');
   const factory = new Function(`${bundle}; return { SidecarParsers, HomesAdapter };`);
   return factory() as { HomesAdapter: HomesSiteAdapter };
 }
@@ -53,6 +53,16 @@ interface HomesSiteAdapter {
   cardInjectionTarget(el: Element): InjectionTarget;
   extractFromCard(el: Element): HouseData | null;
   compFacts(el: Element): { amountText: string | null; priceLabel: string | null; soldDateText: string } | null;
+  mapPinContainer(): Element | null;
+  mapClipElement(): Element | null;
+  buildMapProjection(): {
+    container: Element;
+    host?: Element | null;
+    fit: unknown;
+    clip: DOMRect | null;
+    anchor: { dx: number; dy: number };
+  } | null;
+  projectPoint(projection: unknown, lat: number, lon: number): { x: number; y: number } | null;
   extraInjectionTargets(): Array<{
     container: Element;
     insertAfter: Element | null;
@@ -297,6 +307,21 @@ describe('HomesAdapter — results-page cards', () => {
     // and these would be 8/9/9999.
     expect(house.beds).not.toBe('8');
     expect(house.sqft).not.toBe('9999');
+  });
+
+  it('joins a card to its map marker coordinates by property key', () => {
+    document.body.innerHTML = `${cardHtml({
+      pk: 'vff9j5680b68l',
+      price: '$615,000',
+      address: '2200 Amur Dr Unit B35, Austin, TX 78745',
+      facts: ['4 Beds', '2.5 Baths', '2,282 Sq Ft']
+    })}
+      <gmp-advanced-marker data-pin-pk="vff9j5680b68l" position="30.26522,-97.74668"></gmp-advanced-marker>`;
+
+    expect(HomesAdapter.extractFromCard(HomesAdapter.findCardElements()[0])).toMatchObject({
+      latitude: 30.26522,
+      longitude: -97.74668
+    });
   });
 
   it('reads a studio as 0 beds rather than giving up', () => {
@@ -649,5 +674,53 @@ describe('HomesAdapter — map popup card', () => {
     expect(extra.listingStatus()).toBe('rental');
     expect(extra.isCompEligible('rent')).toBe(true);
     expect(extra.isCompEligible('sold')).toBe(false);
+  });
+
+  it('joins a map popup to its marker coordinates by property key', () => {
+    document.body.innerHTML = `
+      <div>
+        <gmp-advanced-marker data-pin-pk="kbvbfwd3qnh65" position="41.8951,-87.7024"></gmp-advanced-marker>
+      </div>
+      <div class="gm-style-iw"><div class="click-card-container">
+        <a href="/property/726-n-troy-st-chicago-il/kbvbfwd3qnh65/" data-pk="kbvbfwd3qnh65">
+          <div class="top-line-container"><button class="favorite-button"></button><p class="property-price">$380,000</p></div>
+          <ul class="property-info-container"><li>3 Beds</li><li>1 Bath</li></ul>
+          <p class="property-address">726 N Troy St</p><p class="property-city-state-zip">Chicago, IL 60612</p>
+        </a>
+      </div></div>`;
+
+    expect(HomesAdapter.extraInjectionTargets()[0].extract()).toMatchObject({
+      latitude: 41.8951,
+      longitude: -87.7024
+    });
+  });
+});
+
+describe('HomesAdapter — map projection', () => {
+  const mockRect = (element: Element, left: number, top: number, width: number, height: number) => {
+    element.getBoundingClientRect = () => ({
+      left, top, width, height, right: left + width, bottom: top + height,
+      x: left, y: top, toJSON() { return this; }
+    });
+  };
+
+  it('fits Advanced Markers and clips against the real map pane', () => {
+    document.body.innerHTML = `
+      <div id="map" class="search-map-container"></div>
+      <div id="marker-origin">
+        <gmp-advanced-marker position="30.2,-97.8" style="transform: matrix(1, 0, 0, 1, 100, 700)"></gmp-advanced-marker>
+        <gmp-advanced-marker position="30.4,-97.6" style="transform: matrix(1, 0, 0, 1, 900, 100)"></gmp-advanced-marker>
+      </div>`;
+    mockRect(document.getElementById('map')!, 500, 100, 1000, 800);
+    mockRect(document.getElementById('marker-origin')!, 500, 100, 574, 0);
+
+    const projection = HomesAdapter.buildMapProjection()!;
+    expect(projection).not.toBeNull();
+    expect(projection.clip).toMatchObject({ left: 500, top: 100, width: 1000, height: 800 });
+    expect(projection.host).toBe(document.getElementById('map'));
+    expect(projection.anchor).toEqual({ dx: 14.5, dy: 40 });
+    const projected = HomesAdapter.projectPoint(projection, 30.2, -97.8)!;
+    expect(projected.x).toBeCloseTo(100, 4);
+    expect(projected.y).toBeCloseTo(700, 4);
   });
 });

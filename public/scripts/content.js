@@ -6,7 +6,7 @@
 const LOG_PREFIX = '[Investor Sidecar]';
 const OBSERVER_OPTIONS = { childList: true, subtree: true };
 /** Bump when shipping a change that needs to be confirmed as loaded in the browser. */
-const SIDECAR_BUILD = '2026-07-29.1';
+const SIDECAR_BUILD = '2026-07-30.4';
 
 const ADAPTERS = [RedfinAdapter, ZillowAdapter, HomesAdapter];
 const site = ADAPTERS.find(a => a.matchesHost(window.location.hostname)) ?? null;
@@ -163,29 +163,46 @@ function ensureCalculatorStyles() {
         pointer-events: none;
       }
 
-      /* Our own pins on their map (docs/map-linking.md Option 3). A small purple dot,
-         not a full teardrop marker: with no confirmed anchor convention for either
-         site's own pins, a symmetric dot centered on the projected point degrades
-         gracefully if that point is off by a few px, where an asymmetric pin shape
-         would visibly point at the wrong spot. */
       .sidecar-MapPin {
         position: absolute;
-        width: 14px;
-        height: 14px;
-        margin: -7px 0 0 -7px;
-        border-radius: 50%;
-        background: #6D28D9;
-        border: 2px solid #fff;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+        width: 40px;
+        height: 54px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        transform: translate(-50%, -100%);
+        transform-origin: 50% 100%;
+        filter: drop-shadow(0 3px 5px rgba(0, 0, 0, .55));
         cursor: pointer;
         pointer-events: auto;
+        z-index: 900;
+        overflow: visible;
+      }
+      .sidecar-MapPin::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        bottom: -2px;
+        width: 12px;
+        height: 5px;
+        margin-left: -6px;
+        border-radius: 50%;
+        background: rgba(255, 20, 147, .65);
+        animation: sidecar-pin-pulse 1.8s ease-out infinite;
       }
       .sidecar-MapPin:hover,
-      .sidecar-MapPin:focus-visible {
-        width: 18px;
-        height: 18px;
-        margin: -9px 0 0 -9px;
+      .sidecar-MapPin:focus-visible,
+      .sidecar-MapPin.sidecar-MapPin--active {
+        transform: translate(-50%, -100%) scale(1.15);
         outline: none;
+        z-index: 950;
+      }
+      @keyframes sidecar-pin-pulse {
+        from { transform: scale(.6); opacity: .65; }
+        to { transform: scale(2.6); opacity: 0; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .sidecar-MapPin::after { animation: none; }
       }
     `;
   document.head.appendChild(style);
@@ -838,6 +855,8 @@ let lastCleanedUrl = null;
 
 const processPage = () => {
   if (!site) return;
+  scheduleMapReconcile();
+  backfillVisibleMapCoordinates();
 
   // Detail pages get exactly one Analyze button in the header, and deliberately no
   // buttons on the "similar homes" cards below -- clicking one of those would add a
@@ -886,9 +905,21 @@ const processPage = () => {
 // delivery path from the worker after a freshly-created comp tab finishes navigating, so
 // a fast Homes.com result page cannot be stranded outside its just-created session.
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-  if (request?.action !== 'setCompSession') return;
-  applyCompSession(request.session ?? null);
-  sendResponse?.({ ok: true });
+  if (request?.action === 'setCompSession') {
+    applyCompSession(request.session ?? null);
+    sendResponse?.({ ok: true });
+    return;
+  }
+  if (request?.action === 'highlightMapHouse' || request?.action === 'focusMapHouse') {
+    activeMapHouseKey = typeof request.key === 'string' ? request.key : null;
+    applyActiveMapHouse();
+    const pin = [...document.querySelectorAll(MAP_PIN_SELECTOR)]
+      .find((candidate) => candidate.dataset.sidecarHouseKey === activeMapHouseKey);
+    if (request.action === 'focusMapHouse' && pin instanceof HTMLElement) {
+      pin.focus({ preventScroll: true });
+    }
+    sendResponse?.({ ok: true, visible: Boolean(pin) });
+  }
 });
 
 /**
@@ -913,9 +944,10 @@ function isOurNode(node) {
  * the visible map container simply gets no pin (see reconcileMapPins below), which is
  * the "N of M houses shown on this map" the panel surfaces rather than a forced move.
  *
- * Off entirely for a site whose adapter has no buildMapProjection (Homes.com, for now).
+ * Off entirely for a page whose adapter cannot currently build a projection.
  */
 const MAP_PIN_SELECTOR = '[data-sidecar-pin="1"]';
+const NATIVE_MAP_PIN_SELECTOR = '[data-sidecar-native-pin="1"]';
 
 /** Mirrors house-storage.js's houseKey(). Duplicated, not imported: content scripts run
  *  as plain scripts, not ES modules, so they can't import the background worker's module.
@@ -928,23 +960,49 @@ function hasMapCoords(house) {
   return Number.isFinite(house?.latitude) && Number.isFinite(house?.longitude);
 }
 
-let showHousesOnMap = false;
+let mapVisibilityState = { defaultVisible: false, exceptions: new Set() };
 let storedHousesForMap = [];
+const pendingMapGeoBackfills = new Set();
 let mapReconcileTimer = null;
+let mapProjectionRetryTimer = null;
+let mapProjectionRetryAttempts = 0;
 let mapObserver = null;
 let mapObserverContainer = null;
 let lastReportedMapStatus = null;
+let activeMapHouseKey = null;
+
+function mapHouseIsVisible(house) {
+  const excepted = mapVisibilityState.exceptions.has(mapHouseKey(house));
+  return excepted ? !mapVisibilityState.defaultVisible : mapVisibilityState.defaultVisible;
+}
 
 function sweepMapPins() {
   document.querySelectorAll(MAP_PIN_SELECTOR).forEach((el) => el.remove());
+  document.querySelectorAll(NATIVE_MAP_PIN_SELECTOR).forEach((el) => {
+    delete el.dataset.sidecarNativePin;
+    delete el.dataset.sidecarHouseKey;
+  });
 }
 
-function reportMapStatus(shown, total) {
-  if (lastReportedMapStatus && lastReportedMapStatus.shown === shown && lastReportedMapStatus.total === total) {
+function reportMapStatus(shown, total, missing = 0) {
+  if (lastReportedMapStatus && lastReportedMapStatus.shown === shown
+      && lastReportedMapStatus.total === total && lastReportedMapStatus.missing === missing) {
     return;
   }
-  lastReportedMapStatus = { shown, total };
-  chrome.runtime.sendMessage({ action: 'mapPinStatus', shown, total }, () => { void chrome.runtime.lastError; });
+  lastReportedMapStatus = { shown, total, missing };
+  chrome.runtime.sendMessage(
+    { action: 'mapPinStatus', shown, total, missing },
+    () => { void chrome.runtime.lastError; }
+  );
+}
+
+function applyActiveMapHouse() {
+  document.querySelectorAll(MAP_PIN_SELECTOR).forEach((pin) => {
+    pin.classList.toggle(
+      'sidecar-MapPin--active',
+      Boolean(activeMapHouseKey) && pin.dataset.sidecarHouseKey === activeMapHouseKey
+    );
+  });
 }
 
 function createMapPinElement(house, point) {
@@ -956,6 +1014,13 @@ function createMapPinElement(house, point) {
   pin.setAttribute('role', 'button');
   pin.setAttribute('tabindex', '0');
   pin.setAttribute('aria-label', `Show ${house.address || 'this house'} in Investor Sidecar`);
+  pin.title = house.address || 'Saved house';
+  pin.innerHTML = `
+    <svg viewBox="0 0 24 34" width="40" height="54" aria-hidden="true">
+      <path d="M12 1.5C6.5 1.5 2 6 2 11.5c0 7.5 10 21 10 21s10-13.5 10-21C22 6 17.5 1.5 12 1.5z"
+        fill="#FF1493" stroke="#fff" stroke-width="2.2"/>
+      <circle cx="12" cy="11.5" r="4.2" fill="#fff"/>
+    </svg>`;
   pin.style.left = `${point.x}px`;
   pin.style.top = `${point.y}px`;
   return pin;
@@ -996,8 +1061,27 @@ function ensureMapObserver(container) {
 }
 
 function scheduleMapReconcile() {
+  clearTimeout(mapProjectionRetryTimer);
+  mapProjectionRetryTimer = null;
+  mapProjectionRetryAttempts = 0;
   clearTimeout(mapReconcileTimer);
   mapReconcileTimer = setTimeout(reconcileMapPins, 80);
+}
+
+function scheduleMapProjectionRetry() {
+  if (mapProjectionRetryTimer || mapProjectionRetryAttempts >= 20) return;
+  const delay = Math.min(150 + mapProjectionRetryAttempts * 50, 500);
+  mapProjectionRetryTimer = setTimeout(() => {
+    mapProjectionRetryTimer = null;
+    mapProjectionRetryAttempts += 1;
+    reconcileMapPins();
+  }, delay);
+}
+
+function stopMapProjectionRetry() {
+  clearTimeout(mapProjectionRetryTimer);
+  mapProjectionRetryTimer = null;
+  mapProjectionRetryAttempts = 0;
 }
 
 /**
@@ -1007,39 +1091,70 @@ function scheduleMapReconcile() {
  * anchored near the edge to stay rather than flicker out a few px early.
  */
 function reconcileMapPins() {
-  if (!showHousesOnMap || typeof site?.buildMapProjection !== 'function') {
+  const visibleHouses = storedHousesForMap.filter(mapHouseIsVisible);
+  if (visibleHouses.length === 0 || typeof site?.buildMapProjection !== 'function') {
+    stopMapProjectionRetry();
     sweepMapPins();
     ensureMapObserver(null);
     reportMapStatus(0, 0);
     return;
   }
 
-  const candidates = storedHousesForMap.filter(hasMapCoords);
+  const candidates = visibleHouses.filter(hasMapCoords);
+  const missing = visibleHouses.filter((house) => !hasMapCoords(house)).length;
   const projection = site.buildMapProjection();
   ensureMapObserver(typeof site.mapPinContainer === 'function' ? site.mapPinContainer() : null);
 
   if (!projection) {
     sweepMapPins();
-    reportMapStatus(0, candidates.length);
+    reportMapStatus(0, candidates.length, missing);
+    scheduleMapProjectionRetry();
     return;
   }
+  ensureCalculatorStyles();
 
   const container = projection.container;
-  const rect = container.getBoundingClientRect();
+  const host = projection.host || container;
+  // Marker containers are coordinate-space origins and can have zero height. Only their
+  // screen origin is meaningful; visibility is clipped against the adapter's real map pane.
+  const origin = container.getBoundingClientRect();
+  const clip = projection.clip || origin;
+  const hostOrigin = host.getBoundingClientRect();
+  const anchor = projection.anchor || { dx: 0, dy: 0 };
   const margin = 24;
 
   const placed = new Map();
   for (const house of candidates) {
-    const point = site.projectPoint(projection, house.latitude, house.longitude);
-    if (!point) continue;
-    if (point.x < -margin || point.x > rect.width + margin || point.y < -margin || point.y > rect.height + margin) {
+    const projected = site.projectPoint(projection, house.latitude, house.longitude);
+    if (!projected) continue;
+    const point = { x: projected.x + anchor.dx, y: projected.y + anchor.dy };
+    const screenX = origin.left + point.x;
+    const screenY = origin.top + point.y;
+    if (screenX < clip.left - margin || screenX > clip.right + margin
+        || screenY < clip.top - margin || screenY > clip.bottom + margin) {
       continue;
     }
-    placed.set(mapHouseKey(house), { house, point });
+    const renderPoint = host === container
+      ? point
+      : { x: screenX - hostOrigin.left, y: screenY - hostOrigin.top };
+    placed.set(mapHouseKey(house), { house, point: renderPoint });
+  }
+
+  document.querySelectorAll(NATIVE_MAP_PIN_SELECTOR).forEach((el) => {
+    delete el.dataset.sidecarNativePin;
+    delete el.dataset.sidecarHouseKey;
+  });
+  if (typeof site.nativeMapPinForHouse === 'function') {
+    for (const [key, { house }] of placed) {
+      const nativePin = site.nativeMapPinForHouse(house);
+      if (!nativePin) continue;
+      nativePin.dataset.sidecarNativePin = '1';
+      nativePin.dataset.sidecarHouseKey = key;
+    }
   }
 
   const existing = new Map();
-  container.querySelectorAll(MAP_PIN_SELECTOR).forEach((el) => existing.set(el.dataset.sidecarHouseKey, el));
+  document.querySelectorAll(MAP_PIN_SELECTOR).forEach((el) => existing.set(el.dataset.sidecarHouseKey, el));
 
   for (const [key, el] of existing) {
     if (!placed.has(key)) el.remove();
@@ -1050,21 +1165,36 @@ function reconcileMapPins() {
       el.style.left = `${point.x}px`;
       el.style.top = `${point.y}px`;
     } else {
-      container.appendChild(createMapPinElement(house, point));
+      host.appendChild(createMapPinElement(house, point));
     }
   }
 
-  reportMapStatus(placed.size, candidates.length);
+  applyActiveMapHouse();
+  reportMapStatus(placed.size, candidates.length, missing);
+  if (placed.size === 0 && candidates.length > 0) {
+    scheduleMapProjectionRetry();
+  } else {
+    stopMapProjectionRetry();
+  }
 }
 
-async function refreshShowHousesOnMap() {
+async function refreshMapVisibility() {
   try {
-    const result = await chrome.storage.local.get('showHousesOnMap');
-    showHousesOnMap = Boolean(result.showHousesOnMap);
+    const result = await chrome.storage.local.get(['mapVisibility', 'showHousesOnMap']);
+    const stored = result.mapVisibility;
+    mapVisibilityState = {
+      defaultVisible: typeof stored?.defaultVisible === 'boolean'
+        ? stored.defaultVisible
+        : Boolean(result.showHousesOnMap),
+      exceptions: new Set(Array.isArray(stored?.exceptions)
+        ? stored.exceptions.filter((key) => typeof key === 'string')
+        : [])
+    };
   } catch {
-    showHousesOnMap = false;
+    mapVisibilityState = { defaultVisible: false, exceptions: new Set() };
   }
   scheduleMapReconcile();
+  backfillVisibleMapCoordinates();
 }
 
 async function refreshStoredHousesForMap() {
@@ -1075,6 +1205,37 @@ async function refreshStoredHousesForMap() {
     storedHousesForMap = [];
   }
   scheduleMapReconcile();
+  backfillVisibleMapCoordinates();
+}
+
+function backfillVisibleMapCoordinates() {
+  if (!site || typeof site.extractFromCard !== 'function') return;
+  const missing = new Set(
+    storedHousesForMap
+      .filter((house) => house?.source === site.id && !hasMapCoords(house))
+      .map(mapHouseKey)
+  );
+  if (missing.size === 0) return;
+
+  const candidates = site.isDetailPage() && typeof site.extractFromDetailPage === 'function'
+    ? [site.extractFromDetailPage()].filter(Boolean)
+    : site.findCardElements().map((card) => {
+      try {
+        return site.extractFromCard(card);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+
+  for (const house of candidates) {
+    const key = mapHouseKey(house);
+    if (!missing.has(key) || !hasMapCoords(house) || pendingMapGeoBackfills.has(key)) continue;
+    pendingMapGeoBackfills.add(key);
+    chrome.runtime.sendMessage({ action: 'addHouse', house }, () => {
+      void chrome.runtime.lastError;
+      pendingMapGeoBackfills.delete(key);
+    });
+  }
 }
 
 /**
@@ -1088,12 +1249,16 @@ function installMapPinInterceptors() {
   if (mapPinInterceptorsInstalled) return;
   mapPinInterceptorsInstalled = true;
 
-  const ourPin = (e) => {
+  const sidecarPin = (e) => {
     const target = e.target;
-    return target instanceof Element ? target.closest(MAP_PIN_SELECTOR) : null;
+    return target instanceof Element
+      ? target.closest(`${MAP_PIN_SELECTOR}, ${NATIVE_MAP_PIN_SELECTOR}`)
+      : null;
   };
 
   const activate = (pin) => {
+    activeMapHouseKey = pin.dataset.sidecarHouseKey || null;
+    applyActiveMapHouse();
     chrome.runtime.sendMessage(
       { action: 'mapPinClicked', key: pin.dataset.sidecarHouseKey },
       () => { void chrome.runtime.lastError; }
@@ -1101,23 +1266,24 @@ function installMapPinInterceptors() {
   };
 
   document.addEventListener('click', (e) => {
-    const pin = ourPin(e);
+    const pin = sidecarPin(e);
     if (!pin) return;
-    consumeEvent(e);
+    if (pin.matches(MAP_PIN_SELECTOR)) consumeEvent(e);
     activate(pin);
   }, true);
 
   for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup']) {
     document.addEventListener(type, (e) => {
-      if (ourPin(e)) consumeEvent(e);
+      const pin = sidecarPin(e);
+      if (pin?.matches(MAP_PIN_SELECTOR)) consumeEvent(e);
     }, true);
   }
 
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
-    const pin = ourPin(e);
+    const pin = sidecarPin(e);
     if (!pin) return;
-    consumeEvent(e);
+    if (pin.matches(MAP_PIN_SELECTOR)) consumeEvent(e);
     activate(pin);
   }, true);
 }
@@ -1208,6 +1374,16 @@ const init = () => {
   // it causes, this catches browser back/forward.
   window.addEventListener('popstate', scheduleProcess);
 
+  // Browsers throttle layout in background tabs, and every supported map needs real
+  // dimensions before it can project a saved coordinate. Reconcile as soon as a
+  // cold-opened tab becomes visible instead of waiting for the site's next mutation.
+  const reconcileVisibleMap = () => {
+    if (document.visibilityState === 'visible') scheduleMapReconcile();
+  };
+  window.addEventListener('pageshow', scheduleMapReconcile);
+  window.addEventListener('focus', scheduleMapReconcile);
+  document.addEventListener('visibilitychange', reconcileVisibleMap);
+
   // Comp mode. Only the worker can tell this tab apart from an ordinary one, so this
   // tab asks on load and again whenever the session key changes -- a Done click, the
   // session's tab closing, or a fresh session replacing it, all of which the worker
@@ -1218,13 +1394,13 @@ const init = () => {
   // than messaged in, and kept fresh the same reactive way compSession is: on load and
   // on every relevant storage.onChanged.
   installMapPinInterceptors();
-  refreshShowHousesOnMap();
+  refreshMapVisibility();
   refreshStoredHousesForMap();
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     if ('compSession' in changes) refreshCompSession();
-    if ('showHousesOnMap' in changes) refreshShowHousesOnMap();
+    if ('mapVisibility' in changes || 'showHousesOnMap' in changes) refreshMapVisibility();
     if ('storedHouses' in changes) refreshStoredHousesForMap();
   });
 
@@ -1234,7 +1410,7 @@ const init = () => {
     console.log(site.diagnostics());
     console.log('injected buttons:', document.querySelectorAll('.bp-CalculatorExtension').length);
     console.log('comp session:', compSession);
-    console.log('map pins: showHousesOnMap =', showHousesOnMap, ', last status =', lastReportedMapStatus);
+    console.log('map pins: visibility =', mapVisibilityState, ', last status =', lastReportedMapStatus);
     console.groupEnd();
   };
 };
