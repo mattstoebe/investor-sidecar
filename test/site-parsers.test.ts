@@ -19,6 +19,7 @@ function loadParsers() {
     parseBedBathSqft(t: string | null | undefined): { beds: string | null; baths: string | null; sqft: string | null };
     separatedText(root: Element | null | undefined): string;
     parseHoa(t: string | null | undefined): number | null;
+    parseCompAmount(t: string | null | undefined): { amount: number; monthly: boolean; approximate: boolean } | null;
     firstNumber(t: string | null | undefined): string | null;
     absoluteUrl(h: string | null | undefined, o: string): string | null;
     pathnameOf(h: string | null | undefined, o: string): string | null;
@@ -192,6 +193,87 @@ describe('parseHoa', () => {
   // ambiguous match must resolve to null, never to an arbitrary nearby number.
   it('will not reach across unrelated content for a number', () => {
     expect(P.parseHoa('HOA information available upon request. List price $820,000')).toBeNull();
+  });
+});
+
+/**
+ * Fixtures recorded verbatim during live comp-workflow recon (zip 78745, 2026-07-29) --
+ * see docs/comp-workflow.md. These are exactly the price strings both sites render on a
+ * rent/sold comp-search results page.
+ */
+describe('parseCompAmount', () => {
+  it('parses a Redfin house rental price', () => {
+    expect(P.parseCompAmount('$2,100/mo')).toEqual({ amount: 2100, monthly: true, approximate: false });
+  });
+
+  it('flags a Redfin apartment-complex "from" rental price', () => {
+    expect(P.parseCompAmount('$1,200+/mo')).toEqual({ amount: 1200, monthly: true, approximate: true });
+  });
+
+  it('flags a Zillow apartment-complex "from" rental price', () => {
+    expect(P.parseCompAmount('$2,158+Fees may apply')).toEqual({ amount: 2158, monthly: false, approximate: true });
+  });
+
+  // Regression, found live on a genuine (non-"from") Zillow rental card: the "Fees may
+  // apply" line glues straight onto "/mo" with no separator, so "mo" is immediately
+  // followed by a letter rather than whitespace or the end of the string. A
+  // word-boundary-anchored match silently read this as not-monthly, which broke rental
+  // detection for any Zillow card carrying this exact, very common suffix.
+  it('reads "monthly" through Zillow\'s glued "Fees may apply" suffix', () => {
+    expect(P.parseCompAmount('$1,843/moFees may apply'))
+      .toEqual({ amount: 1843, monthly: true, approximate: false });
+  });
+
+  it('parses a plain sold/list price with no unit suffix', () => {
+    expect(P.parseCompAmount('$369,500')).toEqual({ amount: 369500, monthly: false, approximate: false });
+  });
+
+  /**
+   * Regression, reported live on a Zillow sold-search card: both sites abbreviate larger
+   * prices. The plain-digits branch stops at the decimal point, so "$1.10M" read as
+   * amount 1 -- a $1 comp, off by six orders of magnitude. parseMoney in analysis.ts
+   * already handled this shape for ordinary captures; parseCompAmount did not.
+   */
+  it.each([
+    ['$1.10M', 1_100_000],
+    ['$1.2M', 1_200_000],
+    ['$950K', 950_000],
+    ['$1M', 1_000_000],
+    ['$2.35M', 2_350_000]
+  ])('expands the abbreviated price %s', (text, expected) => {
+    expect(P.parseCompAmount(text)?.amount).toBe(expected);
+  });
+
+  it('does not mistake a K/M-abbreviated price for a monthly rent', () => {
+    expect(P.parseCompAmount('$1.10M')).toEqual({ amount: 1_100_000, monthly: false, approximate: false });
+  });
+
+  // "$1.2M+" on an aggregated listing still has to read as a "from" price.
+  it('still flags a "from" marker on an abbreviated price', () => {
+    expect(P.parseCompAmount('$1.2M+')).toEqual({ amount: 1_200_000, monthly: false, approximate: true });
+  });
+
+  // The letter has to be a real unit, not the first letter of an adjacent word -- the
+  // same glued-text hazard that broke the monthly check.
+  it('does not read a following word as a K/M multiplier', () => {
+    expect(P.parseCompAmount('$2,100/moMonthly')?.amount).toBe(2100);
+  });
+
+  // Non-disclosure state (TX): Zillow renders the literal "$--" rather than omitting
+  // the field. There is no honest number here, so this must be null, not 0 or NaN.
+  it('returns null for a non-disclosure-state sold price', () => {
+    expect(P.parseCompAmount('$--')).toBeNull();
+  });
+
+  // Redfin's detail-page stats (readStat) carry no $ sign at all.
+  it('parses a bare number with no dollar sign', () => {
+    expect(P.parseCompAmount('425000')).toEqual({ amount: 425000, monthly: false, approximate: false });
+  });
+
+  it('returns null for text with no number in it', () => {
+    expect(P.parseCompAmount('Contact for pricing')).toBeNull();
+    expect(P.parseCompAmount('')).toBeNull();
+    expect(P.parseCompAmount(null)).toBeNull();
   });
 });
 

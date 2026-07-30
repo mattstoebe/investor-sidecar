@@ -25,14 +25,30 @@ interface Driver {
   ): HTMLElement;
   ensureCalculatorStyles(): void;
   ensureCalculatorOnDetailPage(): void;
+  ensureCalculatorOnCard(cardEl: Element): void;
+  setCompSession(session: unknown): void;
+  StorageManager: {
+    saveHouse(house: unknown): Promise<{ ok: boolean; reason?: string; added?: boolean }>;
+  };
+  buildComp(
+    houseData: unknown,
+    facts: unknown,
+    session: unknown
+  ): { ok: boolean; reason?: string; comp?: Record<string, unknown> };
 }
 
 /**
  * content.js ends by calling init(), which needs an adapter for the current hostname and
  * would install a MutationObserver we don't want here. Loading only the declarations up to
  * that call keeps the unit under test to the injection and event logic.
+ *
+ * Bundled with the real parsers.js, the same way site-adapters.test.ts bundles it with the
+ * adapters -- content.js's comp-mode logic (buildComp, looksLikeRentalPrice) calls
+ * SidecarParsers directly, and it's a separate content-script global in production, not an
+ * import content.js's own source carries.
  */
 function loadDriver(siteStub?: Record<string, unknown>): Driver {
+  const parsersSource = readFileSync(resolve(__dirname, '../public/scripts/sites/parsers.js'), 'utf8');
   const source = readFileSync(resolve(__dirname, '../public/scripts/content.js'), 'utf8');
   const withoutBootstrap = source.replace(/\ninit\(\);\s*$/, '\n');
   // `site` is resolved once at load from the adapter list. Overriding it after the fact is
@@ -48,7 +64,13 @@ function loadDriver(siteStub?: Record<string, unknown>): Driver {
     'chrome',
     'RedfinAdapter',
     'ZillowAdapter',
-    `${withSiteOverride}; return { injectInto, createCalculatorElement, ensureCalculatorStyles, ensureCalculatorOnDetailPage };`
+    'HomesAdapter',
+    `${parsersSource}\n${withSiteOverride}; return {
+      injectInto, createCalculatorElement, ensureCalculatorStyles, ensureCalculatorOnDetailPage,
+      ensureCalculatorOnCard,
+      setCompSession: (s) => { compSession = s; },
+      StorageManager, buildComp
+    };`
   );
   // The driver registers a runtime message listener at load and messages the worker on
   // capture; neither is the subject here. The adapters are real files loaded separately by
@@ -60,7 +82,7 @@ function loadDriver(siteStub?: Record<string, unknown>): Driver {
     }
   };
   const adapterStub = { matchesHost: () => false };
-  return factory(chromeStub, adapterStub, adapterStub) as Driver;
+  return factory(chromeStub, adapterStub, adapterStub, adapterStub) as Driver;
 }
 
 let driver: Driver;
@@ -363,6 +385,101 @@ describe('detail-page injection', () => {
   });
 });
 
+/**
+ * Outside comp mode, a rental listing's card is not a house to Analyze: its price is a
+ * monthly rent, not a purchase price, and feeding "$4,500/mo" into the buy-and-hold
+ * calculator as a $4,500 house was unreachable before comp mode sent anyone to a
+ * rentals search at all -- reported live once it was.
+ */
+describe('card injection: rental listings outside comp mode', () => {
+  const cardSite = (price: string) => ({
+    id: 'redfin',
+    isInjectableCard: () => true,
+    extractFromCard: () => ({ propertyID: '1', price, url: '/home/1' }),
+    cardInjectionTarget: (el: Element) => ({ container: el, insertAfter: null }),
+    cardButtonClassName: 'bp-CalculatorExtension'
+  });
+
+  it('withholds the button on a card whose price is a monthly rent', () => {
+    document.body.innerHTML = '<div id="card"></div>';
+    const card = document.getElementById('card')!;
+    const d = loadDriver(cardSite('$4,500/mo'));
+
+    d.ensureCalculatorOnCard(card);
+    expect(card.querySelector('.bp-CalculatorExtension')).toBeNull();
+  });
+
+  it('still injects normally on an ordinary for-sale card', () => {
+    document.body.innerHTML = '<div id="card"></div>';
+    const card = document.getElementById('card')!;
+    const d = loadDriver(cardSite('$425,000'));
+
+    d.ensureCalculatorOnCard(card);
+    expect(card.querySelector('.bp-CalculatorExtension')).not.toBeNull();
+  });
+
+  it('injects the comp-mode button on the same rental card once a session is active', () => {
+    document.body.innerHTML = '<div id="card"></div>';
+    const card = document.getElementById('card')!;
+    const d = loadDriver(cardSite('$4,500/mo'));
+    d.setCompSession({ kind: 'rent', targetKey: 'redfin:1', subject: { address: '123 Main St' } });
+
+    d.ensureCalculatorOnCard(card);
+    const button = card.querySelector('.bp-CalculatorExtension');
+    expect(button).not.toBeNull();
+    expect(button!.getAttribute('aria-label')).toContain('Add as comp');
+  });
+});
+
+/**
+ * Both sites let the user flip For Sale / Sold / For Rent from the results page, and doing
+ * so does not end an active comp session. Reported live: a sold session left on a for-rent
+ * page happily accepted monthly rents as sale prices. The button is withheld rather than
+ * left to refuse on click.
+ */
+describe('card injection: comp session kind must match the page', () => {
+  const compCardSite = (price: string) => ({
+    id: 'redfin',
+    isInjectableCard: () => true,
+    extractFromCard: () => ({ propertyID: '1', price, url: '/home/1' }),
+    compFacts: () => ({ amountText: price, priceLabel: null, soldDateText: '' }),
+    cardInjectionTarget: (el: Element) => ({ container: el, insertAfter: null }),
+    cardButtonClassName: 'bp-CalculatorExtension'
+  });
+
+  const render = (price: string, kind: 'rent' | 'sold') => {
+    document.body.innerHTML = '<div id="card"></div>';
+    const card = document.getElementById('card')!;
+    const d = loadDriver(compCardSite(price));
+    d.setCompSession({ kind, targetKey: 'redfin:9', subject: { address: '123 Main St' } });
+    d.ensureCalculatorOnCard(card);
+    return card;
+  };
+
+  it('withholds the button on a rental card during a sold session', () => {
+    expect(render('$4,500/mo', 'sold').querySelector('.bp-CalculatorExtension')).toBeNull();
+  });
+
+  it('withholds the button on a sold card during a rent session', () => {
+    expect(render('$369,500', 'rent').querySelector('.bp-CalculatorExtension')).toBeNull();
+  });
+
+  it('injects when the card matches the session kind', () => {
+    expect(render('$369,500', 'sold').querySelector('.bp-CalculatorExtension')).not.toBeNull();
+    expect(render('$4,500/mo', 'rent').querySelector('.bp-CalculatorExtension')).not.toBeNull();
+  });
+
+  // An abbreviated sale price is still a sale price -- this is the shape that used to
+  // parse as $1 and would now also have to survive the kind check.
+  it('accepts an abbreviated sold price during a sold session', () => {
+    expect(render('$1.10M', 'sold').querySelector('.bp-CalculatorExtension')).not.toBeNull();
+  });
+
+  it('still withholds the button on a multi-unit "from" price during a rent session', () => {
+    expect(render('$1,200+/mo', 'rent').querySelector('.bp-CalculatorExtension')).toBeNull();
+  });
+});
+
 describe('button appearance', () => {
   it('marks every node it creates as ours, so the observer can ignore its own output', () => {
     const button = driver.createCalculatorElement(() => ({ ok: true }), { label: 'Analyze' });
@@ -405,5 +522,122 @@ describe('button appearance', () => {
     driver.ensureCalculatorStyles();
     driver.ensureCalculatorStyles();
     expect(document.querySelectorAll('#calculator-styles')).toHaveLength(1);
+  });
+});
+
+/**
+ * The property-id guard. It exists because a non-numeric id used to be stored anyway and
+ * every such house collided on one storage key, so all but the first were silently
+ * discarded. Homes.com ids are alphanumeric, so the rule became adapter-declarable --
+ * these cover both that it opens up for a site that needs it and, more importantly, that
+ * it did not quietly open up for the two sites that don't.
+ */
+describe('property-id guard', () => {
+  const alphanumericSite = {
+    matchesHost: () => true,
+    isValidPropertyId: (id: unknown) => /^[a-z0-9]{6,}$/i.test(String(id ?? ''))
+  };
+
+  it('rejects a non-numeric id for an adapter that declares no validator', async () => {
+    const d = loadDriver({ matchesHost: () => true });
+    const result = await d.StorageManager.saveHouse({ propertyID: 'vff9j5680b68l' });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/identify this listing/i);
+  });
+
+  it('still accepts a bare-digit id for an adapter that declares no validator', async () => {
+    const d = loadDriver({ matchesHost: () => true });
+    expect((await d.StorageManager.saveHouse({ propertyID: '190123456' })).ok).toBe(true);
+  });
+
+  it('accepts an alphanumeric id when the adapter declares it valid', async () => {
+    const d = loadDriver(alphanumericSite);
+    expect((await d.StorageManager.saveHouse({ propertyID: 'vff9j5680b68l' })).ok).toBe(true);
+  });
+
+  it('rejects the empties the guard exists for, whichever rule is in force', async () => {
+    for (const site of [{ matchesHost: () => true }, alphanumericSite]) {
+      const d = loadDriver(site);
+      for (const propertyID of [null, undefined, '', 'N/A']) {
+        expect((await d.StorageManager.saveHouse({ propertyID })).ok, String(propertyID)).toBe(false);
+      }
+      expect((await d.StorageManager.saveHouse({})).ok).toBe(false);
+    }
+  });
+});
+
+/**
+ * The comp path had two more copies of the digits-only id regex besides
+ * StorageManager's, so an adapter that declared isValidPropertyId was still refused
+ * there: isCompEligibleCard withheld the button outright and buildComp refused on click.
+ * Homes.com ids are alphanumeric, so comps were dead for that site while ordinary
+ * Analyze worked -- a split that only showed up as a missing button.
+ */
+describe('comp eligibility respects an adapter-declared id rule', () => {
+  const compCardSite = (extra: Record<string, unknown>) => ({
+    id: 'homes',
+    isInjectableCard: () => true,
+    extractFromCard: () => ({ propertyID: 'vff9j5680b68l', price: '$341,990', url: '/property/x/vff9j5680b68l/' }),
+    compFacts: () => ({ amountText: '$341,990', priceLabel: 'Last List Price', soldDateText: 'Sold Mar 11, 2026' }),
+    cardInjectionTarget: (el: Element) => ({ container: el, insertAfter: null }),
+    cardButtonClassName: 'bp-CalculatorExtension',
+    ...extra
+  });
+
+  const render = (extra: Record<string, unknown>) => {
+    document.body.innerHTML = '<div id="card"></div>';
+    const card = document.getElementById('card')!;
+    const d = loadDriver(compCardSite(extra));
+    d.setCompSession({ kind: 'sold', targetKey: 'homes:abc123def456', subject: { address: '123 Main St, Austin, TX 78745' } });
+    d.ensureCalculatorOnCard(card);
+    return card;
+  };
+
+  it('offers the comp button for an alphanumeric id when the adapter allows it', () => {
+    const card = render({ isValidPropertyId: (id: unknown) => /^[a-z0-9]{6,}$/i.test(String(id ?? '')) });
+    const button = card.querySelector('.bp-CalculatorExtension');
+    expect(button).not.toBeNull();
+    expect(button!.getAttribute('aria-label')).toContain('Add as comp');
+  });
+
+  it('withholds it when the adapter declares nothing, keeping the digits-only default', () => {
+    expect(render({}).querySelector('.bp-CalculatorExtension')).toBeNull();
+  });
+});
+
+/**
+ * buildComp is the click-time gate, and it had its own copy of the id regex. The
+ * injection-gate test above passes even with that copy restored -- the two paths are
+ * genuinely independent, so both need covering.
+ */
+describe('buildComp respects an adapter-declared id rule', () => {
+  const houseData = {
+    source: 'homes',
+    propertyID: 'vff9j5680b68l',
+    address: '8111 Springsteen Dr, Austin, TX 78744',
+    price: '$341,990',
+    beds: '2',
+    baths: '2',
+    sqft: '1437',
+    url: '/property/x/vff9j5680b68l/'
+  };
+  const facts = { amountText: '$341,990', priceLabel: 'Last List Price', soldDateText: 'Sold Mar 11, 2026' };
+  const session = { kind: 'sold', targetKey: 'homes:abc123def456', subject: { address: '123 Main St, Austin, TX 78745' } };
+
+  it('accepts an alphanumeric id when the adapter allows it', () => {
+    const d = loadDriver({
+      id: 'homes',
+      isValidPropertyId: (id: unknown) => /^[a-z0-9]{6,}$/i.test(String(id ?? ''))
+    });
+    const result = d.buildComp(houseData, facts, session);
+    expect(result.ok).toBe(true);
+    expect(result.comp).toMatchObject({ propertyID: 'vff9j5680b68l', amount: 341990 });
+  });
+
+  it('refuses it when the adapter declares nothing', () => {
+    const d = loadDriver({ id: 'homes' });
+    const result = d.buildComp(houseData, facts, session);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/identify this listing from its card/i);
   });
 });
