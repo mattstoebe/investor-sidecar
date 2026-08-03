@@ -223,6 +223,84 @@ var HomesAdapter = (function () {
     return kind === 'rent' ? parsed.monthly : !parsed.monthly;
   }
 
+  function homesFactPairs() {
+    const pairs = [];
+    const seen = new Set();
+    const add = (label, value) => {
+      const cleanLabel = label?.replace(/\s+/g, ' ').trim();
+      const cleanValue = value?.replace(/\s+/g, ' ').trim();
+      if (!cleanLabel || !cleanValue) return;
+      const key = `${cleanLabel}\u0000${cleanValue}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      pairs.push({ label: cleanLabel, value: cleanValue });
+    };
+
+    const root = document.querySelector('#amenities-container');
+    for (const subcategory of root?.querySelectorAll('.subcategory') ?? []) {
+      const heading = subcategory.querySelector('.amenity-name')?.textContent;
+      const items = [...subcategory.querySelectorAll('.amenities-detail')];
+      if (heading && items.length === 1 && !/:/.test(items[0].textContent ?? '')) {
+        add(heading, items[0].textContent);
+      }
+      for (const item of items) {
+        const text = (item.textContent ?? '').replace(/\s+/g, ' ').trim();
+        const match = text.match(/^([^:]{1,80}):\s*(.+)$/);
+        if (match) add(match[1], match[2]);
+      }
+    }
+    return pairs.slice(0, 100);
+  }
+
+  function homesListingDetails() {
+    const extraFacts = homesFactPairs();
+    const fact = (pattern) => extraFacts.find((entry) => pattern.test(entry.label))?.value ?? null;
+    const annualAmount = P.parseMoneyAmount(
+      fact(/^tax annual amount$/i) ?? fact(/est\.? annual taxes/i)
+    );
+    const yearRaw = P.firstNumber(fact(/^tax year$/i));
+    const year = yearRaw === null ? null : Number(yearRaw);
+    const assessedValue = P.parseMoneyAmount(fact(/tax assessed|assessed value/i));
+    const tax = annualAmount === null && assessedValue === null ? null : {
+      annualAmount,
+      year: Number.isInteger(year) ? year : null,
+      assessedValue,
+      sourceKind: 'listing-reported',
+      sourceLabel: 'Homes.com tax information',
+      history: Number.isInteger(year)
+        ? [{ year, annualAmount, assessedValue }]
+        : []
+    };
+
+    const yearBuiltRaw = P.firstNumber(fact(/year built/i));
+    const lotText = fact(/lot details|lot size/i);
+    const lotRaw = P.firstNumber(lotText);
+    const lotNumber = lotRaw === null ? null : Number(lotRaw);
+    const description = P.firstUsable([
+      document.querySelector('.property-description'),
+      document.querySelector('.ldp-description'),
+      document.querySelector('[class*="description-container"]')
+    ])?.textContent?.replace(/\s+/g, ' ').trim() ?? null;
+
+    return {
+      listingStatus: /^per\s+month$/i.test(
+        document.querySelector('.property-info-rent-container .price-label')?.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+      ) ? 'rental' : 'active',
+      propertyType: fact(/home type|property type/i),
+      yearBuilt: yearBuiltRaw === null ? null : Number(yearBuiltRaw),
+      lotSizeSqft: lotText && /acre/i.test(lotText) && Number.isFinite(lotNumber)
+        ? Math.round(lotNumber * 43560)
+        : (Number.isFinite(lotNumber) ? lotNumber : null),
+      parkingSpaces: Number(P.firstNumber(fact(/parking|garage/i))) || null,
+      stories: Number(P.firstNumber(fact(/stories|story property|levels/i))) || null,
+      mlsId: fact(/^mls/i),
+      brokerage: fact(/brokerage|listed by/i),
+      description,
+      tax,
+      extraFacts
+    };
+  }
+
   return {
     id: 'homes',
 
@@ -356,7 +434,8 @@ var HomesAdapter = (function () {
         url: window.location.href,
         latitude: Number.isFinite(latitude) ? latitude : null,
         longitude: Number.isFinite(longitude) ? longitude : null,
-        hoa
+        hoa,
+        details: homesListingDetails()
       };
     },
 

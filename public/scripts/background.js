@@ -1,7 +1,7 @@
 /** Service worker and sole writer of `storedHouses`. */
 import {
     houseKey, applyLocalParams, stampRevision, pushUndoEntry, undoLast,
-    addCompToHouse, removeCompFromHouse
+    addCompToHouse, removeCompFromHouse, mergePageDetailsIntoLatest
 } from './house-storage.js';
 import { buildCompUrl } from './comp-links.js';
 
@@ -90,6 +90,32 @@ function mutateStoredHouses(mutate, undoable) {
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'enrichHouseFromPage') {
+        (async () => {
+            const house = request.house;
+            if (!house || typeof house !== 'object' || !house.propertyID) {
+                sendResponse({ ok: false, reason: 'Invalid detail-page data.' });
+                return;
+            }
+            try {
+                const key = houseKey(house);
+                let tracked = false;
+                await mutateStoredHouses((houses) => {
+                    const merged = mergePageDetailsIntoLatest(houses, key, house);
+                    tracked = merged !== null;
+                    return merged ? merged.updatedHouses : null;
+                });
+                sendResponse({ ok: true, enriched: tracked, tracked });
+            } catch (error) {
+                sendResponse({
+                    ok: false,
+                    reason: error instanceof Error ? error.message : 'Chrome storage failed'
+                });
+            }
+        })();
+        return true;
+    }
+
     if (request.action === "addHouse") {
         (async () => {
             if (!request.house || typeof request.house !== 'object' || !request.house.propertyID) {

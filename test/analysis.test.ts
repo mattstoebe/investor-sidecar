@@ -128,6 +128,18 @@ describe('resolveParams', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toMatch(/Maintenance rate/);
   });
+
+  it('keeps page-reported annual tax as a fixed amount when no rate override exists', () => {
+    const result = resolveParams('$400,000', 0, {}, bareGlobals, 6000);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.params.annualPropertyTax).toBe(6000);
+  });
+
+  it('lets a per-house tax-rate override win over page-reported tax', () => {
+    const result = resolveParams('$400,000', 0, { propertyTaxRate: 2 }, bareGlobals, 6000);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.params.annualPropertyTax).toBeNull();
+  });
 });
 
 describe('analyzeHouse - bare model (all rates at 0)', () => {
@@ -151,6 +163,20 @@ describe('analyzeHouse - bare model (all rates at 0)', () => {
     expect(withHoa.ok && without.ok).toBe(true);
     if (!withHoa.ok || !without.ok) return;
     expect(withHoa.analysis.totalMonthlyExpenses - without.analysis.totalMonthlyExpenses).toBeCloseTo(250, 5);
+  });
+
+  it('uses enriched annual property tax before the global percentage fallback', () => {
+    const result = analyzeHouse('$400,000', 0, { monthlyRent: 3000 }, bareGlobals, 6000);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.analysis.propertyTax).toBe(500);
+  });
+
+  it('uses the explicit house tax rate before enriched annual tax', () => {
+    const result = analyzeHouse(
+      '$400,000', 0, { monthlyRent: 3000, propertyTaxRate: 2 }, bareGlobals, 6000
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.analysis.propertyTax).toBeCloseTo(666.67, 2);
   });
 
   // Was Infinity, and rendered to the user as the string "Infinity%".

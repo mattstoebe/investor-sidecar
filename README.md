@@ -1,6 +1,6 @@
 # Investor Sidecar
 
-A Chrome extension that turns a Redfin or Zillow listing into an investment analysis without
+A Chrome extension that turns a Redfin, Zillow, or Homes.com listing into an investment analysis without
 leaving the page. Click **Analyze** on a listing and it lands in a side panel, modelled
 against your own assumptions under whichever strategy you pick:
 
@@ -11,8 +11,8 @@ against your own assumptions under whichever strategy you pick:
 | BRRRR | The refinance, and what you leave in the deal after it |
 
 Strategy is set panel-wide and overridable per property. Also: per-property assumption
-overrides, sorting by any metric, undo, and an Excel export with one sheet per strategy plus
-a cross-strategy index. See [docs/calculator-modes.md](docs/calculator-modes.md) for how a
+overrides, sorting by any metric, undo, detail-page enrichment, and an Excel export with a
+house sheet plus a house-by-comp sheet. See [docs/calculator-modes.md](docs/calculator-modes.md) for how a
 mode is defined and what it takes to add one.
 
 Everything is stored locally in `chrome.storage.local`. There are no accounts, no analytics
@@ -64,11 +64,19 @@ in the page's DOM which build is actually loaded.
 | --- | --- |
 | `src/` | The side panel — React, TypeScript. `App.tsx` is the panel, `analysis.ts`/`metrics.ts`/`modes.ts` the calculations, `export.ts` the spreadsheet. |
 | `public/scripts/` | Service worker (`background.js`) and content scripts. Plain JS, copied verbatim into the build. |
-| `public/scripts/sites/` | Per-site adapters. All Redfin- and Zillow-specific selectors live here; `content.js` is site-agnostic. |
+| `public/scripts/sites/` | Per-site adapters. All Redfin-, Zillow-, and Homes.com-specific selectors live here; `content.js` is site-agnostic. |
 | `public/manifest.json` | Extension manifest (MV3). |
 | `store/` | Chrome Web Store submission pack — not shipped in the package. |
 
-## The tax and rent service
+## Enrichment
+
+Opening a tracked property's detail page refreshes listing facts from that site, including
+the public annual property-tax history when available. The side-panel sparkle button opens
+that page explicitly. Page facts merge into the latest stored record without touching comps
+or user-entered assumptions. Calculations use a per-house tax-rate override first, then the
+page-reported annual tax, then the global tax-rate fallback.
+
+## The retired tax and rent service
 
 Removed before the store release. It fetched an unauthenticated service over plain http on a
 user-configured `localhost` URL — not something to ship to strangers, and the setting was

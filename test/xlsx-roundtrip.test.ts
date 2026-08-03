@@ -1,42 +1,56 @@
 import { describe, expect, it } from 'vitest';
 import { utils as XLSXUtils, write as xlsxWrite, read as xlsxRead } from 'xlsx';
 import { buildWorkbook } from '../src/export';
+import type { ExportSheet, FormulaCell, WorkbookCell } from '../src/export';
 import { DEFAULT_GLOBAL_PARAMETERS } from '../src/App';
-import type { House, GlobalParameters } from '../src/App';
+import type { Comp, House } from '../src/App';
 
-const globalParams: GlobalParameters = { ...DEFAULT_GLOBAL_PARAMETERS, propertyTaxRate: 1 };
+const isFormula = (cell: WorkbookCell): cell is FormulaCell =>
+  typeof cell === 'object' && cell !== null && 'formula' in cell;
 
-const h = (id: string, price: string, rent: number, sqft: string): House => ({
-  address: `${id} Test St, Dallas, TX 75210`, price, beds: '3', baths: '2', sqft,
-  propertyID: id, url: `https://www.redfin.com/home/${id}`, latitude: 32.7, longitude: -96.8,
-  localParams: { sliderValue: rent }
-});
+const append = (wb: ReturnType<typeof XLSXUtils.book_new>, sheet: ExportSheet) => {
+  const rows = [sheet.headers, ...sheet.rows.map((row) => row.map((cell) => isFormula(cell) ? {
+    f: cell.formula.replace(/^=/, ''),
+    t: cell.resultType === 'string' ? 's' : 'n',
+    v: cell.resultType === 'string' ? '' : 0,
+    z: cell.numberFormat
+  } : cell))];
+  XLSXUtils.book_append_sheet(wb, XLSXUtils.aoa_to_sheet(rows as unknown[][]), sheet.name);
+};
 
-describe('xlsx round trip through the real writer', () => {
-  it('writes a parseable workbook whose numeric cells are numbers, not strings', () => {
-    const houses = [h('a', '$285,000', 2250, '1,420'), h('b', '$675,000', 3750, 'N/A')];
-    const { sheets } = buildWorkbook(houses, globalParams);
-    const rows = sheets[0].rows;
-
+describe('xlsx round trip through SheetJS', () => {
+  it('writes both sheets with numeric inputs and live Excel formulas', () => {
+    const comparable: Comp = {
+      source: 'zillow', propertyID: 'comp-1', kind: 'rent', address: '2 Comp St',
+      amount: 2400, amountLabel: 'rent', beds: '3', baths: '2', sqft: '1,400',
+      url: 'https://www.zillow.com/homedetails/comp-1', capturedAt: Date.UTC(2026, 7, 3)
+    };
+    const house: House = {
+      source: 'redfin', address: '1 Test St', price: '$285,000', beds: '3', baths: '2',
+      sqft: '1,420', propertyID: 'a', url: 'https://www.redfin.com/home/a',
+      latitude: 32.7, longitude: -96.8, localParams: { sliderValue: 2250 },
+      comps: [comparable]
+    };
+    const model = buildWorkbook([house], { ...DEFAULT_GLOBAL_PARAMETERS, propertyTaxRate: 1 });
     const wb = XLSXUtils.book_new();
-    const ws = XLSXUtils.json_to_sheet(rows);
-    XLSXUtils.book_append_sheet(wb, ws, 'Houses');
+    append(wb, model.houses);
+    append(wb, model.comps);
 
     const buf = xlsxWrite(wb, { type: 'buffer', bookType: 'xlsx' });
-    expect(buf.length).toBeGreaterThan(1000);
+    const reread = xlsxRead(buf, { type: 'buffer', cellFormula: true });
 
-    const reread = xlsxRead(buf, { type: 'buffer' });
-    expect(reread.SheetNames).toContain('Houses');
-    const back = XLSXUtils.sheet_to_json<Record<string, unknown>>(reread.Sheets['Houses']);
+    expect(reread.SheetNames).toEqual(['Houses', 'House Comps']);
+    const houses = reread.Sheets.Houses;
+    const priceColumn = model.houses.headers.indexOf('Purchase Price');
+    const paymentColumn = model.houses.headers.indexOf('Monthly P&I');
+    const priceCell = houses[XLSXUtils.encode_cell({ r: 1, c: priceColumn })];
+    const paymentCell = houses[XLSXUtils.encode_cell({ r: 1, c: paymentColumn })];
+    expect(priceCell.t).toBe('n');
+    expect(priceCell.v).toBe(285000);
+    expect(paymentCell.f).toContain('PMT(');
 
-    expect(back).toHaveLength(3);
-    expect(typeof back[0]['Purchase Price']).toBe('number');
-    expect(back[0]['Purchase Price']).toBe(285000);
-    expect(typeof back[0]['Monthly cash flow']).toBe('number');
-    // Missing sqft became a blank cell, so the key is absent rather than the string "Error".
-    expect(back[1]['Square Feet']).toBeUndefined();
-    expect(String(back[2]['Address'])).toMatch(/TOTAL/);
-    // Nothing anywhere in the sheet is the literal "Error" the old export produced.
-    expect(JSON.stringify(back)).not.toContain('Error');
+    const comps = reread.Sheets['House Comps'];
+    const subjectColumn = model.comps.headers.indexOf('Subject Address');
+    expect(comps[XLSXUtils.encode_cell({ r: 1, c: subjectColumn })].f).toContain('INDEX(');
   });
 });

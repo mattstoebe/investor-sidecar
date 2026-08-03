@@ -1,5 +1,5 @@
-import { MortgageCalculator, TaxExpense, HOAExpense, AnnualRateExpense, RateOfRentExpense } from './core-utils';
-import { resolveParams } from './analysis';
+import { MortgageCalculator, HOAExpense, AnnualRateExpense, RateOfRentExpense } from './core-utils';
+import { monthlyPropertyTax, resolveParams } from './analysis';
 import type { ResolvedParams, OperatingBreakdown } from './analysis';
 import type { MetricDef } from './metrics';
 
@@ -83,9 +83,10 @@ export function analyzeBrrrr(
   hoaMonthly: number | null | undefined,
   overrides: Parameters<typeof resolveParams>[2],
   globals: Parameters<typeof resolveParams>[3],
-  inputs: BrrrrInputs
+  inputs: BrrrrInputs,
+  pageAnnualPropertyTax?: number | null
 ): BrrrrResult {
-  const resolved = resolveParams(rawPrice, hoaMonthly, overrides, globals);
+  const resolved = resolveParams(rawPrice, hoaMonthly, overrides, globals, pageAnnualPropertyTax);
   if (!resolved.ok) return resolved;
   const { params } = resolved;
 
@@ -113,7 +114,7 @@ export function analyzeBrrrr(
     const monthlyInterest = new AnnualRateExpense(originalLoan, params.interestRate).getMonthlyExpense();
 
     // No tenant yet, so no rent-scaled expenses -- the property is a building site.
-    const holdTax = new TaxExpense(params.price, params.propertyTaxRate).getMonthlyExpense();
+    const holdTax = monthlyPropertyTax(params);
     const holdInsurance = new AnnualRateExpense(params.price, params.insuranceRate).getMonthlyExpense();
     const hoa = new HOAExpense(params.monthlyHOA).getMonthlyExpense();
     const monthlyHoldingCost = monthlyInterest + holdTax + holdInsurance + hoa;
@@ -144,7 +145,7 @@ export function analyzeBrrrr(
     const vacancyLoss = new RateOfRentExpense(grossMonthlyRent, params.vacancyRate).getMonthlyExpense();
     const effectiveMonthlyIncome = grossMonthlyRent - vacancyLoss;
 
-    const propertyTax = new TaxExpense(inputs.arv, params.propertyTaxRate).getMonthlyExpense();
+    const propertyTax = monthlyPropertyTax(params, inputs.arv);
     const insurance = new AnnualRateExpense(inputs.arv, params.insuranceRate).getMonthlyExpense();
     const maintenance = new RateOfRentExpense(grossMonthlyRent, params.maintenanceRate).getMonthlyExpense();
     const capEx = new RateOfRentExpense(grossMonthlyRent, params.capExRate).getMonthlyExpense();

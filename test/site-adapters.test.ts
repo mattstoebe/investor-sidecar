@@ -27,6 +27,10 @@ function loadAdapters() {
   };
 }
 
+interface TestDetails extends Record<string, unknown> {
+  tax: { history: unknown[]; [key: string]: unknown };
+}
+
 interface HouseData {
   source: string;
   address: string | null;
@@ -39,6 +43,7 @@ interface HouseData {
   latitude: number | null;
   longitude: number | null;
   hoa: number | null;
+  details?: TestDetails;
 }
 /** What both adapters hand back for an injection point. `position` only matters when
  *  `insertAfter` is null: 'prepend' makes us the first child instead of the last. */
@@ -1261,5 +1266,61 @@ describe('ld+json is scoped to the listing being captured', () => {
 
     const h = RedfinAdapter.extractFromDetailPage()!;
     expect(h.latitude).toBeCloseTo(47.77, 2);
+  });
+});
+
+describe('detail-page enrichment facts', () => {
+  it('extracts Redfin tax history and property facts', () => {
+    setLocation('https://www.redfin.com/WA/Seattle/900-NW-134th-St-98177/for-sale/288491');
+    document.body.innerHTML = `
+      <div class="MainHouseInfoPanel"></div>
+      <div class="bp-homeAddress"><span class="full-address">900 NW 134th St, Seattle, WA 98177</span></div>
+      <div class="home-main-stats-variant">
+        <div data-rf-test-id="abp-price"><span class="statsValue">$1,200,000</span></div>
+        <div data-rf-test-id="abp-beds"><span class="statsValue">3</span></div>
+        <div data-rf-test-id="abp-baths">2.5 ba</div>
+        <div data-rf-test-id="abp-sqFt"><span class="statsValue">1,961</span></div>
+      </div>
+      <div class="KeyDetailsTable">
+        <div class="keyDetails-row"><span class="valueType">Property Type</span><span class="valueText">Single Family Residential</span></div>
+        <div class="keyDetails-row"><span class="valueType">Year Built</span><span class="valueText">1948</span></div>
+        <div class="keyDetails-row"><span class="valueType">Lot Size</span><span class="valueText">7,200 Sq. Ft.</span></div>
+      </div>
+      <span class="ListingSource--mlsId">#2556930</span>
+      <span class="agent-basic-details--broker"> • Windermere RE Greenwood </span>
+      <div class="BasicTable__row"><div class="year">2026</div><div class="propertyTax">$14,916 (+10.7%)</div><div class="landAdditions">$849,000 + $331,000</div><div class="assessment">$1,180,000</div></div>
+      <div class="BasicTable__row"><div class="year">2025</div><div class="propertyTax">$13,472</div><div class="landAdditions">$849,000 + $331,000</div><div class="assessment">$1,180,000</div></div>`;
+
+    const details = RedfinAdapter.extractFromDetailPage()!.details!;
+    expect(details).toMatchObject({
+      propertyType: 'Single Family Residential', yearBuilt: 1948, lotSizeSqft: 7200,
+      mlsId: '2556930', brokerage: 'Windermere RE Greenwood',
+      tax: { annualAmount: 14916, year: 2026, assessedValue: 1180000, landValue: 849000, improvementValue: 331000 }
+    });
+    expect(details.tax.history).toHaveLength(2);
+  });
+
+  it('separates Zillow public tax history from its payment estimate', () => {
+    setLocation('https://www.zillow.com/homedetails/test/3991886_zpid/');
+    document.title = '5529 S Throop St, Chicago, IL 60636 | MLS #12679433 | Zillow';
+    document.body.innerHTML = `
+      <h1>5529 S Throop St</h1><div data-testid="price">$244,997</div>
+      <div data-testid="bed-bath-sqft-facts">4beds2baths2,008sqft</div>
+      <div data-testid="fact-category"><ul>
+        <li>Home type: Single family</li><li>Year built: 1895</li>
+        <li>Tax assessed value: $43,010</li><li>Annual tax amount: $1,582</li>
+      </ul></div>
+      <table><tr><th>Year</th><th>Property taxes</th><th>Tax assessment</th></tr>
+        <tr><td>2024</td><td>--</td><td>$43,010</td></tr>
+        <tr><td>2023</td><td><span data-testid="tax-money-cell">$1,582 +2.6%</span></td><td>$7,499</td></tr>
+      </table>
+      <li data-testid="legend-propertyTax">Property taxes: $508</li>`;
+
+    const tax = ZillowAdapter.extractFromDetailPage()!.details!.tax;
+    expect(tax).toMatchObject({
+      annualAmount: 1582, year: 2023, assessedValue: 43010,
+      estimatedMonthlyAmount: 508, sourceKind: 'public-history'
+    });
+    expect(tax.history).toHaveLength(2);
   });
 });

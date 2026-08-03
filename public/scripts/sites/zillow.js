@@ -304,6 +304,103 @@ var ZillowAdapter = (function () {
     return { container: list, insertAfter: item, position: 'append' };
   }
 
+  function zillowFactPairs() {
+    const pairs = [];
+    const seen = new Set();
+    for (const item of document.querySelectorAll('[data-testid="fact-category"] li')) {
+      const text = (item.textContent ?? '').replace(/\s+/g, ' ').trim();
+      const match = text.match(/^([^:]{1,80}):\s*(.+)$/);
+      if (!match) continue;
+      const label = match[1].trim();
+      const value = match[2].trim();
+      const key = `${label}\u0000${value}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        pairs.push({ label, value });
+      }
+    }
+    return pairs.slice(0, 100);
+  }
+
+  function zillowTaxDetails(extraFacts) {
+    const history = [];
+    for (const table of document.querySelectorAll('table')) {
+      const header = table.querySelector('tr')?.textContent ?? '';
+      if (!/Property taxes/i.test(header) || !/Tax assessment/i.test(header)) continue;
+      for (const row of table.querySelectorAll('tr')) {
+        const cells = [...row.querySelectorAll('th, td')]
+          .map((cell) => (cell.textContent ?? '').replace(/\s+/g, ' ').trim());
+        const year = Number(cells[0]);
+        if (!Number.isInteger(year) || cells.length < 3) continue;
+        history.push({
+          year,
+          annualAmount: P.parseMoneyAmount(cells[1]),
+          assessedValue: P.parseMoneyAmount(cells[2])
+        });
+      }
+      break;
+    }
+    history.sort((a, b) => b.year - a.year);
+
+    const fact = (pattern) => extraFacts.find((entry) => pattern.test(entry.label))?.value ?? null;
+    const summaryAnnual = P.parseMoneyAmount(fact(/annual tax amount/i));
+    const summaryAssessment = P.parseMoneyAmount(fact(/tax assessed value/i));
+    const latestWithTax = history.find((entry) => Number.isFinite(entry.annualAmount));
+    const estimatedMonthlyAmount = P.parseMoneyAmount(
+      document.querySelector('[data-testid="legend-propertyTax"]')?.textContent
+    );
+    if (!latestWithTax && summaryAnnual === null && estimatedMonthlyAmount === null) return null;
+
+    return {
+      annualAmount: latestWithTax?.annualAmount ?? summaryAnnual,
+      year: latestWithTax?.year ?? null,
+      assessedValue: summaryAssessment ?? latestWithTax?.assessedValue ?? null,
+      estimatedMonthlyAmount,
+      sourceKind: latestWithTax || summaryAnnual !== null ? 'public-history' : 'payment-estimate',
+      sourceLabel: latestWithTax || summaryAnnual !== null
+        ? 'Zillow public tax history'
+        : 'Zillow payment estimate',
+      history: history.slice(0, 10)
+    };
+  }
+
+  function zillowListingDetails() {
+    const extraFacts = zillowFactPairs();
+    const fact = (pattern) => extraFacts.find((entry) => pattern.test(entry.label))?.value ?? null;
+    const yearBuiltRaw = P.firstNumber(fact(/year built/i));
+    const yearBuilt = yearBuiltRaw === null ? null : Number(yearBuiltRaw);
+    const lotText = fact(/lot size/i);
+    const lotRaw = P.firstNumber(lotText);
+    const lotNumber = lotRaw === null ? null : Number(lotRaw);
+    const lotSizeSqft = lotText && /acre/i.test(lotText) && Number.isFinite(lotNumber)
+      ? Math.round(lotNumber * 43560)
+      : (Number.isFinite(lotNumber) ? lotNumber : null);
+    const description = P.firstUsable([
+      document.querySelector('[data-testid="description"]'),
+      document.querySelector('[data-testid="home-description"]'),
+      document.querySelector('[data-testid="home-description-text-description"]')
+    ])?.textContent?.replace(/\s+/g, ' ').trim() ?? null;
+    const mlsId = document.title.match(/MLS\s*#\s*([A-Z0-9-]+)/i)?.[1] ?? null;
+    const daysText = fact(/days on zillow|days on market/i)
+      ?? document.querySelector('[data-testid="days-on-zillow"]')?.textContent;
+
+    return {
+      listingStatus: /\/\s*mo/i.test(document.querySelector('[data-testid="price"]')?.textContent ?? '')
+        ? 'rental' : 'active',
+      propertyType: fact(/home type|property type/i),
+      yearBuilt: Number.isInteger(yearBuilt) ? yearBuilt : null,
+      lotSizeSqft,
+      parkingSpaces: Number(P.firstNumber(fact(/parking|garage/i))) || null,
+      stories: Number(P.firstNumber(fact(/stories|levels/i))) || null,
+      daysOnMarket: Number(P.firstNumber(daysText)) || null,
+      mlsId,
+      brokerage: fact(/listed by|brokerage/i),
+      description,
+      tax: zillowTaxDetails(extraFacts),
+      extraFacts
+    };
+  }
+
   return {
     id: 'zillow',
 
@@ -430,7 +527,8 @@ var ZillowAdapter = (function () {
         url: window.location.href,
         latitude: geo?.latitude ?? null,
         longitude: geo?.longitude ?? null,
-        hoa
+        hoa,
+        details: zillowListingDetails()
       };
     },
 

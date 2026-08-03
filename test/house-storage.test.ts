@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error -- plain JS module shipped as-is to the service worker, no types.
-import { houseKey, mergeEnrichmentIntoLatest, applyLocalParams, stampRevision, addCompToHouse, removeCompFromHouse, compKey, applyUndoEntry } from '../public/scripts/house-storage.js';
+import { houseKey, mergeEnrichmentIntoLatest, mergePageDetailsIntoLatest, applyLocalParams, stampRevision, addCompToHouse, removeCompFromHouse, compKey, applyUndoEntry } from '../public/scripts/house-storage.js';
 
 /**
  * These cover the write path that protects panel edits from asynchronous API
@@ -9,7 +9,7 @@ import { houseKey, mergeEnrichmentIntoLatest, applyLocalParams, stampRevision, a
  * the user typed in the side panel meanwhile would be silently reverted.
  */
 
-const house = (over: Record<string, unknown> = {}) => ({
+const house = <T extends Record<string, unknown>>(over: T = {} as T) => ({
   source: 'redfin',
   propertyID: '30926649',
   address: '123 Main St, Dallas, TX 75201',
@@ -141,6 +141,62 @@ describe('mergeEnrichmentIntoLatest', () => {
     expect(result.updatedHouses[0].address).toBe('First');
     expect(result.updatedHouses[2].address).toBe('Third');
     expect(result.updatedHouses[1].apiTaxRate).toBe(1.81);
+  });
+});
+
+describe('mergePageDetailsIntoLatest', () => {
+  it('adds canonical page facts and caps tax history', () => {
+    const history = Array.from({ length: 14 }, (_, index) => ({
+      year: 2026 - index, annualAmount: 1000 + index, assessedValue: 100000
+    }));
+    const result = mergePageDetailsIntoLatest([house()], 'redfin:30926649', {
+      source: 'redfin', price: '$440,000', hoa: 125,
+      details: { propertyType: 'Single Family', tax: { annualAmount: 5200, year: 2026, history } }
+    }, 1234)!;
+
+    expect(result.updatedHouse.price).toBe('$440,000');
+    expect(result.updatedHouse.hoa).toBe(125);
+    expect(result.updatedHouse.details.tax.annualAmount).toBe(5200);
+    expect(result.updatedHouse.details.tax.history).toHaveLength(10);
+    expect(result.updatedHouse.details.enrichedAt).toBe(1234);
+  });
+
+  it('never overwrites user assumptions, comps, or revision state', () => {
+    const current = house({
+      rev: 7,
+      lastWriter: 'card-2',
+      localParams: { sliderValue: 2800, propertyTaxRate: 2.1 },
+      comps: [{ source: 'zillow', propertyID: '1', kind: 'rent' }]
+    });
+    const result = mergePageDetailsIntoLatest([current], 'redfin:30926649', {
+      details: { tax: { annualAmount: 4800 } },
+      localParams: { sliderValue: 1 }, comps: []
+    }, 1234)!;
+
+    expect(result.updatedHouse.localParams).toEqual(current.localParams);
+    expect(result.updatedHouse.comps).toEqual(current.comps);
+    expect(result.updatedHouse.rev).toBe(7);
+    expect(result.updatedHouse.lastWriter).toBe('card-2');
+  });
+
+  it('does not erase known facts with empty incoming values', () => {
+    const current = house({
+      beds: '3',
+      details: { propertyType: 'Condo', tax: { annualAmount: 3600, year: 2025 } }
+    });
+    const result = mergePageDetailsIntoLatest([current], 'redfin:30926649', {
+      beds: null,
+      details: { propertyType: null, tax: { annualAmount: null, year: 2026 } }
+    })!;
+
+    expect(result.updatedHouse.beds).toBe('3');
+    expect(result.updatedHouse.details.propertyType).toBe('Condo');
+    expect(result.updatedHouse.details.tax.annualAmount).toBe(3600);
+    expect(result.updatedHouse.details.tax.year).toBe(2026);
+  });
+
+  it('returns null for an untracked house', () => {
+    expect(mergePageDetailsIntoLatest([], 'redfin:30926649', { details: {} })).toBeNull();
   });
 });
 

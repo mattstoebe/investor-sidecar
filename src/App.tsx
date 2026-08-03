@@ -4,6 +4,7 @@ import type { OperatingBreakdown } from './analysis';
 // Lazy so recharts stays out of the panel's initial bundle; see RentChart.tsx.
 const RentChart = lazy(() => import('./RentChart'));
 import { buildWorkbook } from './export';
+import type { ExportSheet, FormulaCell, WorkbookCell } from './export';
 import {
   METRICS,
   TONE_CLASSES,
@@ -28,6 +29,45 @@ interface RentEstimate {
   mid: number;
   iqrhigh: number;
   max: number;
+}
+
+export interface TaxHistoryEntry {
+  year: number;
+  annualAmount: number | null;
+  assessedValue: number | null;
+  landValue?: number | null;
+  improvementValue?: number | null;
+}
+
+export interface ListingTaxDetails {
+  annualAmount?: number | null;
+  year?: number | null;
+  assessedValue?: number | null;
+  landValue?: number | null;
+  improvementValue?: number | null;
+  estimatedMonthlyAmount?: number | null;
+  sourceKind?: 'public-history' | 'listing-reported' | 'payment-estimate';
+  sourceLabel?: string;
+  history?: TaxHistoryEntry[];
+}
+
+export interface ListingDetails {
+  schemaVersion?: number;
+  enrichedAt?: number;
+  source?: 'redfin' | 'zillow' | 'homes';
+  listingStatus?: 'active' | 'pending' | 'sold' | 'rental' | 'off-market' | null;
+  propertyType?: string | null;
+  yearBuilt?: number | null;
+  lotSizeSqft?: number | null;
+  parkingSpaces?: number | null;
+  stories?: number | null;
+  daysOnMarket?: number | null;
+  listedDate?: string | null;
+  mlsId?: string | null;
+  brokerage?: string | null;
+  description?: string | null;
+  tax?: ListingTaxDetails;
+  extraFacts?: Array<{ label: string; value: string }>;
 }
 
 /**
@@ -94,6 +134,8 @@ export interface House {
   apiTaxRate?: number | null;
   taxError?: string | null;
   hoa?: number;
+  /** Canonical facts captured from the listing's full detail page. */
+  details?: ListingDetails;
   /**
    * Bumped by the worker on every write to this house, and stamped with the id of whoever
    * caused it. Together they let a card tell a write it made itself -- which it must ignore,
@@ -766,11 +808,16 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, onSho
 
   const result = useMemo(
     () => MODES[mode].analyze({
-      house: { price: house.price, hoa: house.hoa, sqft: house.sqft },
+      house: {
+        price: house.price,
+        hoa: house.hoa,
+        sqft: house.sqft,
+        annualPropertyTax: house.details?.tax?.annualAmount ?? null
+      },
       overrides,
       globals: globalParams
     }),
-    [house.price, house.hoa, house.sqft, overrides, globalParams, mode]
+    [house.price, house.hoa, house.sqft, house.details?.tax?.annualAmount, overrides, globalParams, mode]
   );
 
   const analysis = result.ok ? result.analysis.detail : null;
@@ -1296,6 +1343,23 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, onSho
         </button>
         <button
           type="button"
+          aria-label={`Enrich ${house.address || 'house'} from ${SITE_NAMES[house.source ?? 'redfin']}`}
+          title={house.details?.enrichedAt
+            ? `Refresh enrichment from ${SITE_NAMES[house.source ?? 'redfin']} (last updated ${new Date(house.details.enrichedAt).toLocaleString()})`
+            : `Open ${SITE_NAMES[house.source ?? 'redfin']} and enrich this house`}
+          className={`rounded p-1.5 transition-colors ${
+            house.details?.enrichedAt
+              ? 'text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950'
+              : 'text-violet-500 hover:bg-violet-50 hover:text-violet-600 dark:hover:bg-violet-950'
+          }`}
+          onClick={() => window.open(house.url, '_blank')}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="m12 3 1.15 3.35L16.5 7.5l-3.35 1.15L12 12l-1.15-3.35L7.5 7.5l3.35-1.15L12 3Zm6 9 .8 2.2L21 15l-2.2.8L18 18l-.8-2.2L15 15l2.2-.8L18 12ZM6.5 13l1.05 2.95L10.5 17l-2.95 1.05L6.5 21l-1.05-2.95L2.5 17l2.95-1.05L6.5 13Z" />
+          </svg>
+        </button>
+        <button
+          type="button"
           aria-label={`Open listing on ${SITE_NAMES[house.source ?? 'redfin']}`}
           title={`Open on ${SITE_NAMES[house.source ?? 'redfin']}`}
           className="rounded p-1.5 text-blue-500 hover:bg-blue-50 hover:text-blue-600 dark:hover:bg-blue-950"
@@ -1347,6 +1411,13 @@ export function HouseCard({ house, globalParams, onRemoved, onModeChanged, onSho
               {house.beds ?? '—'} bd · {house.baths ?? '—'} ba
             </span>
           </div>
+          {house.details?.tax?.annualAmount != null && (
+            <div className="text-xs text-gray-500 dark:text-gray-400">
+              Property tax: ${house.details.tax.annualAmount.toLocaleString()}/yr
+              {house.details.tax.year ? ` (${house.details.tax.year})` : ''}
+              {house.details.tax.sourceLabel ? ` · ${house.details.tax.sourceLabel}` : ''}
+            </div>
+          )}
 
           <ModePicker
             house={house}
@@ -1819,22 +1890,41 @@ function Title() {
         const { utils: XLSXUtils, writeFile } = await import('xlsx');
 
         const wb = XLSXUtils.book_new();
-        const addSheet = (name: string, rows: Record<string, unknown>[]) => {
-          if (rows.length === 0) return;
-          const ws = XLSXUtils.json_to_sheet(rows);
-          ws['!cols'] = Object.keys(rows[0]).map((key) => ({ wch: Math.max(12, key.length + 2) }));
-          // Excel rejects sheet names over 31 characters, and truncating quietly is better
-          // than failing the whole export over a long mode label.
-          XLSXUtils.book_append_sheet(wb, ws, name.slice(0, 31));
+        const isFormula = (cell: WorkbookCell): cell is FormulaCell =>
+          typeof cell === 'object' && cell !== null && 'formula' in cell;
+        const excelCell = (cell: WorkbookCell) => {
+          if (!isFormula(cell)) return cell;
+          return {
+            f: cell.formula.replace(/^=/, ''),
+            t: cell.resultType === 'string' ? 's' : 'n',
+            v: cell.resultType === 'string' ? '' : 0,
+            z: cell.numberFormat
+          };
+        };
+        const addSheet = (sheet: ExportSheet) => {
+          const rows = [sheet.headers, ...sheet.rows.map((row) => row.map(excelCell))];
+          const ws = XLSXUtils.aoa_to_sheet(rows as unknown[][]);
+          ws['!cols'] = sheet.widths.map((wch) => ({ wch }));
+          ws['!autofilter'] = {
+            ref: `A1:${XLSXUtils.encode_col(sheet.headers.length - 1)}${sheet.rows.length + 1}`
+          };
+
+          const urlColumn = sheet.headers.findIndex((header) => header.endsWith('URL'));
+          if (urlColumn >= 0) {
+            for (let index = 0; index < sheet.rows.length; index += 1) {
+              const url = sheet.rows[index][urlColumn];
+              if (typeof url !== 'string' || !url) continue;
+              const ref = XLSXUtils.encode_cell({ r: index + 1, c: urlColumn });
+              if (ws[ref]) ws[ref].l = { Target: url };
+            }
+          }
+
+          XLSXUtils.book_append_sheet(wb, ws, sheet.name);
         };
 
-        // The index first, so a mixed board can still be read in one place.
-        addSheet('All houses', workbook.index as unknown as Record<string, unknown>[]);
-        // Each sheet already carries its own totals row: comparable columns only exist
-        // within a strategy.
-        for (const sheet of workbook.sheets) addSheet(sheet.name, sheet.rows);
-
-        writeFile(wb, `investor-sidecar-${timestamp}.xlsx`);
+        addSheet(workbook.houses);
+        addSheet(workbook.comps);
+        writeFile(wb, `investor-sidecar-${timestamp}.xlsx`, { cellStyles: true });
         setExportState('idle');
       } catch (error) {
         console.error('Export to Excel failed:', error);

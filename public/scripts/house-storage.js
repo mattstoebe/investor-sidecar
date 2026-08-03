@@ -87,6 +87,63 @@ export function mergeEnrichmentIntoLatest(houses, key, enrichment) {
   return { updatedHouses, updatedHouse };
 }
 
+const PAGE_FACT_FIELDS = [
+  'address', 'price', 'beds', 'baths', 'sqft', 'url',
+  'latitude', 'longitude', 'hoa'
+];
+
+function present(value) {
+  return value !== null && value !== undefined && value !== '';
+}
+
+function mergePresent(current, incoming) {
+  const merged = { ...(current || {}) };
+  for (const [field, value] of Object.entries(incoming || {})) {
+    if (present(value)) merged[field] = value;
+  }
+  return merged;
+}
+
+/**
+ * Merges facts read from a detail page into the newest stored record.
+ *
+ * Page facts never touch localParams or comps. They also do not bump `rev`: the panel's
+ * house array still re-renders from the storage broadcast, while an in-progress parameter
+ * edit remains in the mounted card instead of being treated as stale foreign input.
+ */
+export function mergePageDetailsIntoLatest(houses, key, incoming, now = Date.now()) {
+  const index = houses.findIndex((house) => houseKey(house) === key);
+  if (index === -1) return null;
+
+  const current = houses[index];
+  const updatedHouse = { ...current };
+  for (const field of PAGE_FACT_FIELDS) {
+    if (present(incoming?.[field])) updatedHouse[field] = incoming[field];
+  }
+
+  const details = mergePresent(current.details, incoming?.details);
+  if (incoming?.details?.tax) {
+    details.tax = mergePresent(current.details?.tax, incoming.details.tax);
+    if (Array.isArray(incoming.details.tax.history) && incoming.details.tax.history.length > 0) {
+      details.tax.history = incoming.details.tax.history.slice(0, 10);
+    }
+  }
+  if (Array.isArray(incoming?.details?.extraFacts) && incoming.details.extraFacts.length > 0) {
+    details.extraFacts = incoming.details.extraFacts.slice(0, 100);
+  }
+
+  updatedHouse.details = {
+    ...details,
+    schemaVersion: 1,
+    enrichedAt: now,
+    source: incoming?.source || current.source || 'redfin'
+  };
+
+  const updatedHouses = [...houses];
+  updatedHouses[index] = updatedHouse;
+  return { updatedHouses, updatedHouse };
+}
+
 /** Identifies a comp within one house's list, for dedupe and removal. */
 export function compKey(comp) {
   return `${comp?.source}:${comp?.propertyID}:${comp?.kind}`;

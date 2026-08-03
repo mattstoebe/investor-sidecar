@@ -1,5 +1,5 @@
-import { MortgageCalculator, TaxExpense, HOAExpense, AnnualRateExpense } from './core-utils';
-import { resolveParams } from './analysis';
+import { MortgageCalculator, HOAExpense, AnnualRateExpense } from './core-utils';
+import { monthlyPropertyTax, resolveParams } from './analysis';
 import type { ResolvedParams } from './analysis';
 import type { MetricDef } from './metrics';
 
@@ -79,9 +79,10 @@ export function analyzeFlip(
   hoaMonthly: number | null | undefined,
   overrides: Parameters<typeof resolveParams>[2],
   globals: Parameters<typeof resolveParams>[3],
-  inputs: FlipInputs
+  inputs: FlipInputs,
+  pageAnnualPropertyTax?: number | null
 ): FlipResult {
-  const resolved = resolveParams(rawPrice, hoaMonthly, overrides, globals);
+  const resolved = resolveParams(rawPrice, hoaMonthly, overrides, globals, pageAnnualPropertyTax);
   if (!resolved.ok) return resolved;
   const { params } = resolved;
 
@@ -111,7 +112,7 @@ export function analyzeFlip(
     // Carrying costs. Rent-scaled expenses have no meaning here -- nobody is living in it --
     // so vacancy, maintenance, CapEx and management are all absent by construction rather
     // than set to zero.
-    const propertyTax = new TaxExpense(params.price, params.propertyTaxRate).getMonthlyExpense();
+    const propertyTax = monthlyPropertyTax(params);
     const insurance = new AnnualRateExpense(params.price, params.insuranceRate).getMonthlyExpense();
     const hoa = new HOAExpense(params.monthlyHOA).getMonthlyExpense();
     const monthlyHoldingCost = monthlyInterest + propertyTax + insurance + hoa;

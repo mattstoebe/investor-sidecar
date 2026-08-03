@@ -24,6 +24,8 @@ export interface ResolvedParams {
   downPaymentPercent: number;
   interestRate: number;
   propertyTaxRate: number;
+  /** Page-reported annual tax, used only when no per-house tax-rate override exists. */
+  annualPropertyTax: number | null;
   monthlyHOA: number;
   maxDown: number | null;
   downPayment: number;
@@ -218,7 +220,8 @@ export function resolveParams(
   rawPrice: string | number | null | undefined,
   hoaMonthly: number | null | undefined,
   overrides: AnalysisOverrides,
-  globals: AnalysisGlobals
+  globals: AnalysisGlobals,
+  pageAnnualPropertyTax?: number | null
 ): { ok: true; params: ResolvedParams } | { ok: false; reason: string } {
   const price = overrides.price ?? parseMoney(rawPrice);
 
@@ -234,6 +237,12 @@ export function resolveParams(
   const maxDown = globals.maxDown;
 
   const propertyTaxRate = resolveRate(overrides.propertyTaxRate, globals.propertyTaxRate);
+  const hasPageAnnualTax = pageAnnualPropertyTax !== null && pageAnnualPropertyTax !== undefined;
+  const annualTaxNumber = Number(pageAnnualPropertyTax);
+  const annualPropertyTax = !propertyTaxRate.overridden && hasPageAnnualTax
+    && Number.isFinite(annualTaxNumber) && annualTaxNumber >= 0
+    ? annualTaxNumber
+    : null;
   const vacancyRate = resolveRate(overrides.vacancyRate, globals.vacancyRate);
   const maintenanceRate = resolveRate(overrides.maintenanceRate, globals.maintenanceRate);
   const capExRate = resolveRate(overrides.capExRate, globals.capExRate);
@@ -275,6 +284,7 @@ export function resolveParams(
       downPaymentPercent,
       interestRate,
       propertyTaxRate: propertyTaxRate.value,
+      annualPropertyTax,
       monthlyHOA: monthlyHOA < 0 ? 0 : monthlyHOA,
       maxDown,
       downPayment,
@@ -302,13 +312,21 @@ export function resolveParams(
   };
 }
 
+/** Actual page-reported tax wins over a percentage fallback, unless the user overrode the rate. */
+export function monthlyPropertyTax(params: ResolvedParams, rateBasis = params.price): number {
+  return params.annualPropertyTax !== null
+    ? params.annualPropertyTax / 12
+    : new TaxExpense(rateBasis, params.propertyTaxRate).getMonthlyExpense();
+}
+
 export function analyzeHouse(
   rawPrice: string | number | null | undefined,
   hoaMonthly: number | null | undefined,
   overrides: AnalysisOverrides,
-  globals: AnalysisGlobals
+  globals: AnalysisGlobals,
+  pageAnnualPropertyTax?: number | null
 ): RentalResult {
-  const resolved = resolveParams(rawPrice, hoaMonthly, overrides, globals);
+  const resolved = resolveParams(rawPrice, hoaMonthly, overrides, globals, pageAnnualPropertyTax);
   if (!resolved.ok) return resolved;
 
   const { params } = resolved;
@@ -323,7 +341,7 @@ export function analyzeHouse(
     const effectiveMonthlyIncome = grossMonthlyRent - vacancyLoss;
 
     // Operating expenses -- everything NOI is net of, i.e. everything except financing.
-    const propertyTax = new TaxExpense(params.price, params.propertyTaxRate).getMonthlyExpense();
+    const propertyTax = monthlyPropertyTax(params);
     const insurance = new AnnualRateExpense(params.price, params.insuranceRate).getMonthlyExpense();
     const hoa = new HOAExpense(params.monthlyHOA).getMonthlyExpense();
     const maintenance = new RateOfRentExpense(grossMonthlyRent, params.maintenanceRate).getMonthlyExpense();

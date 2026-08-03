@@ -22,6 +22,7 @@ export interface ModeHouseFacts {
   price: string | number | null | undefined;
   hoa?: number | null;
   sqft?: string | null;
+  annualPropertyTax?: number | null;
 }
 
 export interface ModeInput {
@@ -87,7 +88,7 @@ const RENTAL: CalculatorMode = {
   metrics: RENTAL_METRICS,
   defaultMetrics: ['monthlyCashFlow', 'capRate', 'dscr'],
   analyze: ({ house, overrides, globals }) => {
-    const result = analyzeHouse(house.price, house.hoa, overrides, globals);
+    const result = analyzeHouse(house.price, house.hoa, overrides, globals, house.annualPropertyTax);
     if (!result.ok) return result;
     return {
       ok: true,
@@ -126,7 +127,7 @@ const FLIP: CalculatorMode = {
       holdMonths: overrides.holdMonths ?? globals.holdMonths,
       sellingCostRate: overrides.sellingCostRate ?? globals.sellingCostRate,
       maoRulePercent: overrides.maoRulePercent ?? globals.maoRulePercent
-    });
+    }, house.annualPropertyTax);
     if (!result.ok) return result;
     return {
       ok: true,
@@ -182,7 +183,7 @@ const BRRRR: CalculatorMode = {
       refiRate: overrides.refiRate ?? globals.refiRate,
       refiCostRate: overrides.refiCostRate ?? globals.refiCostRate,
       monthlyRent: overrides.monthlyRent ?? 0
-    });
+    }, house.annualPropertyTax);
     if (!result.ok) return result;
     return {
       ok: true,
@@ -224,12 +225,17 @@ export function missingRequirement(mode: ModeId, overrides: ModeOverrides): keyo
 }
 
 export function analyzeStoredHouse(
-  house: Pick<House, 'price' | 'hoa' | 'localParams'> & { sqft?: string | null },
+  house: Pick<House, 'price' | 'hoa' | 'localParams' | 'details'> & { sqft?: string | null },
   globals: GlobalParameters
 ): AnalysisResult {
   const mode = resolveMode(house.localParams?.mode ?? null, globals.mode).value;
   return MODES[mode].analyze({
-    house: { price: house.price, hoa: house.hoa, sqft: house.sqft },
+    house: {
+      price: house.price,
+      hoa: house.hoa,
+      sqft: house.sqft,
+      annualPropertyTax: house.details?.tax?.annualAmount ?? null
+    },
     overrides: storedOverrides(house),
     globals
   });

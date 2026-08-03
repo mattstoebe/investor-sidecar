@@ -6,7 +6,7 @@
 const LOG_PREFIX = '[Investor Sidecar]';
 const OBSERVER_OPTIONS = { childList: true, subtree: true };
 /** Bump when shipping a change that needs to be confirmed as loaded in the browser. */
-const SIDECAR_BUILD = '2026-07-30.4';
+const SIDECAR_BUILD = '2026-08-03.1';
 
 const ADAPTERS = [RedfinAdapter, ZillowAdapter, HomesAdapter];
 const site = ADAPTERS.find(a => a.matchesHost(window.location.hostname)) ?? null;
@@ -801,7 +801,8 @@ function removeInjectedButton(button) {
   (wrapper && wrapper.querySelectorAll('.bp-CalculatorExtension').length === 1 ? wrapper : button).remove();
 }
 
-function ensureCalculatorOnDetailPage() {
+function ensureCalculatorOnDetailPage(houseData) {
+  houseData ??= site.extractFromDetailPage();
   const target = site.detailInjectionTarget();
   if (!target?.container) return;
   const { container } = target;
@@ -821,7 +822,6 @@ function ensureCalculatorOnDetailPage() {
   }
   if (existing) return;
 
-  const houseData = site.extractFromDetailPage();
   const status = listingStatus({ detail: true, houseData });
   if (actionForListing(status, compSession) === 'none') return;
 
@@ -850,6 +850,22 @@ function ensureCalculatorOnDetailPage() {
   injectInto(target, wrapper);
 }
 
+let lastDetailEnrichmentSignature = null;
+let detailEnrichmentInFlight = null;
+
+function enrichTrackedHouseFromDetail(houseData) {
+  if (!houseData?.propertyID || !houseData.details) return;
+  const signature = `${window.location.href}\u0000${JSON.stringify(houseData)}`;
+  if (signature === lastDetailEnrichmentSignature || signature === detailEnrichmentInFlight) return;
+
+  detailEnrichmentInFlight = signature;
+  chrome.runtime.sendMessage({ action: 'enrichHouseFromPage', house: houseData }, (response) => {
+    void chrome.runtime.lastError;
+    if (response?.ok) lastDetailEnrichmentSignature = signature;
+    if (detailEnrichmentInFlight === signature) detailEnrichmentInFlight = null;
+  });
+}
+
 /** Guards the stale-card sweep so it runs once per page, not once per mutation batch. */
 let lastCleanedUrl = null;
 
@@ -875,7 +891,9 @@ const processPage = () => {
       }
       lastCleanedUrl = window.location.href;
     }
-    ensureCalculatorOnDetailPage();
+    const houseData = site.extractFromDetailPage();
+    enrichTrackedHouseFromDetail(houseData);
+    ensureCalculatorOnDetailPage(houseData);
     return;
   }
 

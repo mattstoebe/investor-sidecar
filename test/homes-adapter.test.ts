@@ -33,6 +33,9 @@ interface HouseData {
   latitude: number | null;
   longitude: number | null;
   hoa: number | null;
+  details?: Record<string, unknown> & {
+    tax?: { history?: unknown[]; [key: string]: unknown };
+  };
 }
 interface InjectionTarget {
   container: Element | null;
@@ -433,7 +436,7 @@ describe('HomesAdapter — detail page', () => {
       amenities: '<h3 class="amenity-name">HOA Fees</h3><li class="amenities-detail">$125 Monthly HOA Fees</li>',
       ldJson: AMUR_LD
     });
-    expect(HomesAdapter.extractFromDetailPage()).toEqual({
+    expect(HomesAdapter.extractFromDetailPage()).toMatchObject({
       source: 'homes',
       address: '2200 Amur Dr Unit B35, Austin, TX 78745',
       price: '615000',
@@ -722,5 +725,34 @@ describe('HomesAdapter — map projection', () => {
     const projected = HomesAdapter.projectPoint(projection, 30.2, -97.8)!;
     expect(projected.x).toBeCloseTo(100, 4);
     expect(projected.y).toBeCloseTo(700, 4);
+  });
+});
+
+describe('HomesAdapter — detail enrichment', () => {
+  it('extracts annual tax, tax year, and canonical property facts', () => {
+    setLocation('https://www.homes.com/property/953-e-61st-st-chicago-il-unit-1e/g8jc35492xnnz/');
+    document.title = '953 E 61st St Unit 1E, Chicago, IL 60637 | Homes.com';
+    document.body.innerHTML = `
+      <h1>953 E 61st St Unit 1E</h1><div id="price">$250,000</div>
+      <div class="ldp-property-info-container">
+        <div class="property-info-feature"><span>2</span><span class="feature-beds">Beds</span></div>
+        <div class="property-info-feature"><span>1</span><span class="feature-baths">Baths</span></div>
+        <div class="property-info-feature"><span>1,000</span><span class="feature-sqft">Sq Ft</span></div>
+      </div>
+      <div id="amenities-container">
+        <div class="subcategory"><h3 class="amenity-name">Home Type</h3><ul><li class="amenities-detail">Condominium</li></ul></div>
+        <div class="subcategory"><h3 class="amenity-name">Year Built</h3><ul><li class="amenities-detail">Built in 1903</li></ul></div>
+        <div class="subcategory"><h3 class="amenity-name">Tax Info</h3><ul>
+          <li class="amenities-detail">Tax Annual Amount: 1308</li>
+          <li class="amenities-detail">Tax Year: 2023</li>
+        </ul></div>
+      </div>
+      <script type="application/ld+json">{"@graph":[{"@type":"RealEstateListing","url":"https://www.homes.com/property/x/g8jc35492xnnz/","name":"953 E 61st St Unit 1E, Chicago, IL 60637","offers":{"price":250000},"mainEntity":{}}]}</script>`;
+
+    const details = HomesAdapter.extractFromDetailPage()!.details!;
+    expect(details).toMatchObject({
+      propertyType: 'Condominium', yearBuilt: 1903,
+      tax: { annualAmount: 1308, year: 2023, sourceKind: 'listing-reported' }
+    });
   });
 });

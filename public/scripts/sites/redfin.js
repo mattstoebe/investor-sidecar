@@ -97,6 +97,103 @@ var RedfinAdapter = (function () {
     return Boolean(document.querySelector('[data-rf-test-name="stat-price"]'));
   }
 
+  function redfinTaxDetails() {
+    const history = [];
+    for (const row of document.querySelectorAll('.BasicTable__row')) {
+      const year = Number(row.querySelector('.year')?.textContent?.trim());
+      const taxCell = row.querySelector('.propertyTax');
+      if (!Number.isInteger(year) || !taxCell) continue;
+      const annualAmount = P.parseMoneyAmount(taxCell.textContent);
+      const assessment = P.parseMoneyAmount(row.querySelector('.assessment')?.textContent);
+      const additions = [...(row.querySelector('.landAdditions')?.textContent ?? '').matchAll(/\$\s*([\d,]+)/g)]
+        .map((match) => Number(match[1].replace(/,/g, '')));
+      history.push({
+        year,
+        annualAmount,
+        assessedValue: assessment,
+        landValue: Number.isFinite(additions[0]) ? additions[0] : null,
+        improvementValue: Number.isFinite(additions[1]) ? additions[1] : null
+      });
+    }
+    history.sort((a, b) => b.year - a.year);
+    const latest = history.find((entry) => Number.isFinite(entry.annualAmount)) ?? history[0] ?? null;
+
+    const mortgageRoot = document.querySelector('[data-rf-test-id="MortgageCalculator"], #MortgageCalculator');
+    let estimatedMonthlyAmount = null;
+    if (mortgageRoot) {
+      const candidates = [...mortgageRoot.querySelectorAll('div')]
+        .map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim())
+        .filter((text) => /^Property taxes\s*\$/i.test(text))
+        .sort((a, b) => a.length - b.length);
+      estimatedMonthlyAmount = P.parseMoneyAmount(candidates[0]);
+    }
+
+    if (!latest && estimatedMonthlyAmount === null) return null;
+    return {
+      annualAmount: latest?.annualAmount ?? null,
+      year: latest?.year ?? null,
+      assessedValue: latest?.assessedValue ?? null,
+      landValue: latest?.landValue ?? null,
+      improvementValue: latest?.improvementValue ?? null,
+      estimatedMonthlyAmount,
+      sourceKind: latest ? 'public-history' : 'payment-estimate',
+      sourceLabel: latest ? 'Redfin tax history' : 'Redfin payment estimate',
+      history: history.slice(0, 10)
+    };
+  }
+
+  function redfinListingDetails() {
+    const extraFacts = [];
+    for (const row of document.querySelectorAll('.KeyDetailsTable .keyDetails-row')) {
+      const label = row.querySelector('.valueType')?.textContent?.replace(/\s+/g, ' ').trim();
+      const value = row.querySelector('.valueText')?.textContent?.replace(/\s+/g, ' ').trim();
+      if (label && value) extraFacts.push({ label, value });
+    }
+    const fact = (pattern) => extraFacts.find((entry) => pattern.test(entry.label))?.value ?? null;
+    const lotText = fact(/lot size/i);
+    const parkingText = fact(/parking/i);
+    const storiesText = fact(/stories|levels/i);
+    const yearBuiltRaw = P.firstNumber(fact(/year built/i));
+    const yearBuilt = yearBuiltRaw === null ? null : Number(yearBuiltRaw);
+    const lotRaw = P.firstNumber(lotText);
+    const lotNumber = lotRaw === null ? null : Number(lotRaw);
+    const lotSizeSqft = lotText && /acre/i.test(lotText) && Number.isFinite(lotNumber)
+      ? Math.round(lotNumber * 43560)
+      : (Number.isFinite(lotNumber) ? lotNumber : null);
+    const pageText = document.querySelector('.MainHouseInfoPanel')?.textContent ?? '';
+    const statusText = document.querySelector('.ListingStatusBannerSection, [class*="ListingStatus"]')?.textContent ?? pageText;
+    const listingStatus = isRentalTemplate() ? 'rental'
+      : /pending/i.test(statusText) ? 'pending'
+        : /sold/i.test(statusText) ? 'sold'
+          : /off market/i.test(statusText) ? 'off-market'
+            : 'active';
+    const mlsText = document.querySelector(
+      '.ListingSource--mlsId, [data-rf-test-id="mls-id"], [class*="sourceContent"]'
+    )?.textContent ?? document.title;
+    const mlsId = mlsText.match(/(?:MLS(?:#|\s*ID\s*#?)\s*|#)([A-Z0-9-]+)/i)?.[1] ?? null;
+    const brokerage = document.querySelector('.agent-basic-details--broker')?.textContent
+      ?.replace(/^\s*•\s*/, '').replace(/\s+/g, ' ').trim() ?? null;
+    const description = P.firstUsable([
+      document.querySelector('.remarks'),
+      document.querySelector('[data-rf-test-id="remarks"]'),
+      document.querySelector('[class*="Remarks"]')
+    ])?.textContent?.replace(/\s+/g, ' ').trim() ?? null;
+
+    return {
+      listingStatus,
+      propertyType: fact(/property type|style/i),
+      yearBuilt: Number.isInteger(yearBuilt) ? yearBuilt : null,
+      lotSizeSqft,
+      parkingSpaces: Number(P.firstNumber(parkingText)) || null,
+      stories: Number(P.firstNumber(storiesText)) || null,
+      mlsId,
+      brokerage,
+      description,
+      tax: redfinTaxDetails(),
+      extraFacts
+    };
+  }
+
   return {
     id: 'redfin',
 
@@ -182,7 +279,8 @@ var RedfinAdapter = (function () {
           latitude: geo?.latitude ?? null,
           longitude: geo?.longitude ?? null,
           // Rentals don't carry an HOA line the way for-sale listings do.
-          hoa: null
+          hoa: null,
+          details: redfinListingDetails()
         };
       }
 
@@ -218,7 +316,8 @@ var RedfinAdapter = (function () {
         url: geo?.url ?? window.location.href,
         latitude: geo?.latitude ?? null,
         longitude: geo?.longitude ?? null,
-        hoa
+        hoa,
+        details: redfinListingDetails()
       };
     },
 
